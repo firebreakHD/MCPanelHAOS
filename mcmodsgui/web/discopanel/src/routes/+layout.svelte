@@ -1,0 +1,374 @@
+<script lang="ts">
+	import '../app.css';
+	import { ModeWatcher } from 'mode-watcher';
+	import { page } from '$app/state';
+	import { goto } from '$app/navigation';
+	import { resolve as resolvePath } from '$app/paths';
+	import {
+		SidebarProvider,
+		SidebarInset,
+		Sidebar,
+		SidebarContent,
+		SidebarGroup,
+		SidebarGroupLabel,
+		SidebarGroupContent,
+		SidebarMenu,
+		SidebarMenuItem,
+		SidebarMenuButton,
+		SidebarHeader,
+		SidebarFooter,
+		SidebarTrigger
+	} from '$lib/components/ui/sidebar';
+	import { Separator } from '$lib/components/ui/separator';
+	import { Badge } from '$lib/components/ui/badge';
+	import { Button } from '$lib/components/ui/button';
+	import { Avatar, AvatarFallback } from '$lib/components/ui/avatar';
+	import {
+		DropdownMenu,
+		DropdownMenuContent,
+		DropdownMenuItem,
+		DropdownMenuLabel,
+		DropdownMenuSeparator,
+		DropdownMenuTrigger
+	} from '$lib/components/ui/dropdown-menu';
+	import { get } from 'svelte/store';
+	import { serversStore, runningServers, activitySortedServers } from '$lib/stores/servers';
+	import { authStore, currentUser, canAccessSettings, authEnabled } from '$lib/stores/auth';
+	import { onMount } from 'svelte';
+	import { Toaster } from '$lib/components/ui/sonner';
+	import GlobalLoading from '$lib/components/global-loading.svelte';
+
+	import {
+		Server,
+		Home,
+		Settings,
+		Package,
+		User as UserIcon,
+		LogOut,
+		LogIn,
+		FileText,
+		Sun,
+		Moon,
+		Puzzle
+	} from '@lucide/svelte';
+	import { toggleMode, mode } from 'mode-watcher';
+	import { ServerStatus, type User } from '$lib/proto/discopanel/v1/common_pb';
+
+	let { children } = $props();
+
+	let servers = $derived($activitySortedServers);
+	let runningCount = $derived($runningServers.length);
+	let user = $derived($currentUser);
+	let showSettingsNav = $derived($canAccessSettings);
+	let loading = $state(true);
+	let isAuthEnabled = $derived($authEnabled);
+
+	function getUserInitials(user: User) {
+		if (!user) return '';
+		return user.username.slice(0, 2).toUpperCase();
+	}
+
+	function getDisplayRole(user: User): string {
+		if (!user?.roles?.length) return 'No roles';
+		return user.roles[0];
+	}
+
+	async function handleLogout() {
+		await authStore.logout();
+	}
+
+	let statusPollingInterval: ReturnType<typeof setInterval> | null = null;
+
+	onMount(() => {
+		return new Promise((resolve, reject) => {
+			authStore
+				.checkAuthStatus()
+				.then(async (authStatus) => {
+					loading = false;
+					if (authStatus.enabled) {
+						if (authStatus.firstUserSetup) {
+							goto(resolvePath('/login'));
+							return false;
+						}
+						const isValid = await authStore.validateSession();
+						if (!isValid) {
+							// If anonymous access is enabled, allow browsing without login
+							const state = get(authStore);
+							if (!state.anonymousAccessEnabled) {
+								goto(resolvePath('/login'));
+								return false;
+							}
+						}
+					}
+					return true;
+				})
+				.then((shouldFetch) => {
+					// Only fetch servers if auth succeeded (not redirecting to login)
+					if (shouldFetch && page.url.pathname !== '/login') {
+						serversStore.fetchServers(false).catch((err) => {
+							console.error('Failed to fetch initial servers:', err);
+						});
+
+						if (!statusPollingInterval) {
+							statusPollingInterval = setInterval(() => {
+								if (page.url.pathname !== '/login') {
+									serversStore.fetchServers(true);
+								}
+							}, 10000);
+						}
+					}
+
+					// Clean up on unmount
+					resolve(() => {
+						if (statusPollingInterval) {
+							clearInterval(statusPollingInterval);
+							statusPollingInterval = null;
+						}
+					});
+				})
+				.catch((err) => {
+					console.debug(`Discopanel caught a polling error: ${err}`);
+					reject(err);
+				});
+		});
+	});
+</script>
+
+<svelte:head>
+	<title>DiscoPanel - Minecraft Server Management</title>
+</svelte:head>
+
+<ModeWatcher />
+<Toaster position="bottom-center" expand={true} richColors />
+<GlobalLoading />
+
+{#if page.url.pathname === '/login'}
+	{@render children?.()}
+{:else if loading}
+	<div class="flex min-h-screen items-center justify-center">
+		<div class="h-8 w-8 animate-spin rounded-full border-b-2 border-primary"></div>
+	</div>
+{:else}
+	<div>
+		<SidebarProvider>
+			<Sidebar collapsible="icon">
+				<SidebarHeader class="my-2">
+					<div class="m-auto flex items-center gap-2">
+						<img src="/g1_24x24.png" alt="DiscoPanel Logo" class="h-6 w-6" />
+						<span class="text-lg font-bold group-data-[collapsible=icon]:hidden">DiscoPanel</span>
+					</div>
+				</SidebarHeader>
+
+				<SidebarContent>
+					<SidebarGroup>
+						<SidebarGroupLabel class="group-data-[collapsible=icon]:opacity-0"
+							>Navigation</SidebarGroupLabel
+						>
+						<SidebarGroupContent>
+							<SidebarMenu>
+								<SidebarMenuItem>
+									<SidebarMenuButton isActive={page.url.pathname === '/'}>
+										{#snippet child({ props })}
+											<a href={resolvePath('/')} {...props}>
+												<Home class="h-4 w-4" />
+												<span class="group-data-[collapsible=icon]:hidden">Dashboard</span>
+											</a>
+										{/snippet}
+									</SidebarMenuButton>
+								</SidebarMenuItem>
+								<SidebarMenuItem>
+									<SidebarMenuButton isActive={page.url.pathname.startsWith('/servers')}>
+										{#snippet child({ props })}
+											<a href={resolvePath('/servers')} {...props}>
+												<Server class="h-4 w-4" />
+												<span class="group-data-[collapsible=icon]:hidden">Servers</span>
+												{#if runningCount > 0}
+													<Badge
+														variant="secondary"
+														class="ml-auto group-data-[collapsible=icon]:hidden"
+														>{runningCount}</Badge
+													>
+												{/if}
+											</a>
+										{/snippet}
+									</SidebarMenuButton>
+								</SidebarMenuItem>
+								<SidebarMenuItem>
+									<SidebarMenuButton isActive={page.url.pathname.startsWith('/modpacks')}>
+										{#snippet child({ props })}
+											<a href={resolvePath('/modpacks')} {...props}>
+												<Package class="h-4 w-4" />
+												<span class="group-data-[collapsible=icon]:hidden">Modpacks</span>
+											</a>
+										{/snippet}
+									</SidebarMenuButton>
+								</SidebarMenuItem>
+								{#if showSettingsNav}
+									<SidebarMenuItem>
+										<SidebarMenuButton isActive={page.url.pathname.startsWith('/modules')}>
+											{#snippet child({ props })}
+												<a href={resolvePath('/modules')} {...props}>
+													<Puzzle class="h-4 w-4" />
+													<span class="group-data-[collapsible=icon]:hidden">Modules</span>
+												</a>
+											{/snippet}
+										</SidebarMenuButton>
+									</SidebarMenuItem>
+								{/if}
+								{#if showSettingsNav}
+									<SidebarMenuItem>
+										<SidebarMenuButton isActive={page.url.pathname === '/settings'}>
+											{#snippet child({ props })}
+												<a href={resolvePath('/settings')} {...props}>
+													<Settings class="h-4 w-4" />
+													<span class="group-data-[collapsible=icon]:hidden">Settings</span>
+												</a>
+											{/snippet}
+										</SidebarMenuButton>
+									</SidebarMenuItem>
+								{/if}
+								<SidebarMenuItem>
+									<SidebarMenuButton isActive={page.url.pathname.startsWith('/docs/api')}>
+										{#snippet child({ props })}
+											<a href={resolvePath('/docs/api')} {...props}>
+												<FileText class="h-4 w-4" />
+												<span class="group-data-[collapsible=icon]:hidden">API</span>
+											</a>
+										{/snippet}
+									</SidebarMenuButton>
+								</SidebarMenuItem>
+							</SidebarMenu>
+						</SidebarGroupContent>
+					</SidebarGroup>
+
+					{#if servers.length > 0}
+						<div class="group-data-[collapsible=icon]:hidden">
+							<Separator />
+							<SidebarGroup>
+								<SidebarGroupLabel>Quick Access</SidebarGroupLabel>
+								<SidebarGroupContent>
+									<SidebarMenu>
+										{#each servers as server (server.id)}
+											<SidebarMenuItem>
+												<SidebarMenuButton isActive={page.url.pathname === `/servers/${server.id}`}>
+													{#snippet child({ props })}
+														<a href={resolvePath(`/servers/${server.id}`)} {...props}>
+															<div class="flex w-full items-center gap-2">
+																<div
+																	class="h-2 w-2 rounded-full {server.status ===
+																	ServerStatus.RUNNING
+																		? 'bg-green-500'
+																		: server.status === ServerStatus.ERROR
+																			? 'animate-pulse bg-red-500'
+																			: server.status === ServerStatus.STARTING ||
+																				  server.status === ServerStatus.STOPPING ||
+																				  server.status === ServerStatus.UNHEALTHY
+																				? 'bg-yellow-500'
+																				: 'bg-gray-400'}"
+																></div>
+																<span class="truncate">{server.name}</span>
+															</div>
+														</a>
+													{/snippet}
+												</SidebarMenuButton>
+											</SidebarMenuItem>
+										{/each}
+									</SidebarMenu>
+								</SidebarGroupContent>
+							</SidebarGroup>
+						</div>
+					{/if}
+				</SidebarContent>
+
+				<SidebarFooter>
+					{#if isAuthEnabled && user}
+						<Separator orientation="horizontal" />
+						<div class="flex items-center justify-between">
+							<DropdownMenu>
+								<div class="w-full py-2">
+									<DropdownMenuTrigger
+										class="h-full w-full justify-start group-data-[collapsible=icon]:p-0"
+									>
+										{#snippet child({ props })}
+											<Button {...props} variant="ghost">
+												<Avatar class="h-8 w-8">
+													<AvatarFallback>{getUserInitials(user)}</AvatarFallback>
+												</Avatar>
+												<div class="ml-2 flex-1 text-left group-data-[collapsible=icon]:hidden">
+													<p class="text-sm leading-none font-medium">{user.username}</p>
+													<p class="text-xs text-muted-foreground capitalize">
+														{getDisplayRole(user)}
+													</p>
+												</div>
+											</Button>
+										{/snippet}
+									</DropdownMenuTrigger>
+								</div>
+								<DropdownMenuContent class="w-56" align="end">
+									<DropdownMenuLabel>
+										<div class="flex flex-col space-y-1">
+											<p class="text-sm leading-none font-medium">{user.username}</p>
+											{#if user.email}
+												<p class="text-xs leading-none text-muted-foreground">{user.email}</p>
+											{/if}
+											<p class="text-xs leading-none text-muted-foreground capitalize">
+												{user.roles?.length ? user.roles.join(', ') : 'No roles'}
+											</p>
+										</div>
+									</DropdownMenuLabel>
+									<DropdownMenuSeparator />
+									<DropdownMenuItem onclick={() => goto(resolvePath('/profile'))}>
+										<UserIcon class="mr-2 h-4 w-4" />
+										<span>Profile</span>
+									</DropdownMenuItem>
+									<DropdownMenuSeparator />
+									<DropdownMenuItem onclick={handleLogout}>
+										<LogOut class="mr-2 h-4 w-4" />
+										<span>Log out</span>
+									</DropdownMenuItem>
+								</DropdownMenuContent>
+							</DropdownMenu>
+						</div>
+					{:else if isAuthEnabled && $authStore.anonymousAccessEnabled && !user}
+						<Separator orientation="horizontal" />
+						<div class="w-full py-2">
+							<Button
+								variant="ghost"
+								class="w-full justify-start"
+								onclick={() => goto(resolvePath('/login'))}
+							>
+								<LogIn class="h-4 w-4" />
+								<span class="group-data-[collapsible=icon]:hidden">Login</span>
+							</Button>
+						</div>
+					{/if}
+					<Separator orientation="horizontal" class="mb-2" />
+					<div class="ml-auto flex items-center gap-2">
+						<span class="text-xs text-muted-foreground group-data-[collapsible=icon]:hidden"
+							>{__APP_VERSION__}</span
+						>
+						<Button
+							variant="ghost"
+							size="icon"
+							class="h-7 w-7 group-data-[collapsible=icon]:hidden"
+							onclick={toggleMode}
+						>
+							{#if mode.current === 'light'}
+								<Moon class="h-4 w-4 text-muted-foreground" />
+							{:else}
+								<Sun class="h-4 w-4 text-muted-foreground" />
+							{/if}
+						</Button>
+						<SidebarTrigger />
+					</div>
+				</SidebarFooter>
+			</Sidebar>
+
+			<SidebarInset class="flex h-screen flex-col">
+				<main class="flex-1">
+					{@render children?.()}
+				</main>
+			</SidebarInset>
+		</SidebarProvider>
+	</div>
+{/if}

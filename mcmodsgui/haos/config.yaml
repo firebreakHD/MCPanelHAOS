@@ -1,0 +1,24 @@
+server:
+  host: "127.0.0.1"
+  port: "8080"
+  write_timeout: 150
+database:
+  path: /app/discopanel/data/discopanel.db
+docker:
+  host: unix:///run/docker.sock
+  network_name: mcpanelhaos-disco
+storage:
+  data_dir: /app/discopanel/data
+  backup_dir: /app/discopanel/backups
+  temp_dir: /app/discopanel/tmp
+auth:
+  anonymous_access: false
+  local:
+    enabled: true
+    allow_registration: false
+proxy:
+  enabled: false
+module:
+  enabled: false
+logging:
+  file_path: /app/discopanel/data/discopanel.log

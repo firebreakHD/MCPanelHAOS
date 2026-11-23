@@ -1,25 +1,22 @@
 # MCPanelHAOS
 
-Ein Home-Assistant-OS-Add-on für zwei Minecraft-Java-Modpacks auf **demselben** HAOS-Rechner. Das Webpanel basiert auf [Minepanel](https://github.com/Ketbome/minepanel). Panel, Minecraft und Welten brauchen keinen weiteren Rechner.
+DiscoPanel als Home-Assistant-OS-Add-on für Minecraft Java auf demselben Gerät. Erstelle zwei getrennte Serverprofile mit eigenen Namen, Welten und Modpacks. Es kann jeweils ein Profil laufen. Beide sind unter derselben HAOS-IP über TCP-Port **25565** erreichbar.
 
-## Das eigene GitHub-Repository veröffentlichen
+## Installation
 
-1. In GitHub Desktop **File → Add Local Repository** öffnen und den Ordner `MCPanelHAOS` wählen.
-2. **Publish repository** anklicken, den Namen **MCPanelHAOS** verwenden und **Keep this code private** abwählen. Home Assistant kann das öffentliche Repository ohne GitHub-Login abrufen.
-3. Die URL des veröffentlichten Repositories in Home Assistant unter **Einstellungen → Apps/Add-ons → Installieren → ⋮ → Repositories** hinzufügen. **MCPanelHAOS** auswählen und installieren.
+1. [Repository in Home Assistant hinzufügen](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FfirebreakHD%2FMCPanelHAOS) oder im Add-on-Store unter **Repositorys** die Adresse `https://github.com/firebreakHD/MCPanelHAOS` eintragen.
+2. **MCPanelHAOS** installieren. Bei einem Update von Minepanel zuerst den Minecraft-Server stoppen und ein HA-Backup erstellen.
+3. **Schutzmodus** beim Add-on deaktivieren. Die vom Supervisor bereitgestellte Docker-API gibt dem Add-on weitreichenden Zugriff auf den Host. Das Add-on ist für HAOS auf AMD64 gebaut.
+4. Falls du statt `homeassistant.local` eine andere Adresse verwendest, trage sie unter **Konfiguration** in `panel_hostname` ein. Der externe HTTPS-Port ist **18443**. Bei einem vorhandenen Setup prüfe **Netzwerk** und `panel_port` in **Konfiguration**. Beide müssen den gleichen externen Port verwenden.
+5. Add-on starten. **Weboberfläche öffnen** führt zum DiscoPanel-Login. Die deutsche Startseite in der Home-Assistant-Seitenleiste enthält den Link und das lokale HTTPS-Stammzertifikat.
+6. Beim ersten Aufruf einen lokalen Admin erstellen.
 
-## Starten
+## CurseForge und Serverwechsel
 
-1. Für **MCPanelHAOS** den Schutzmodus deaktivieren und starten.
-2. Die Seitenleiste einblenden und **MCPanelHAOS** öffnen. Beim ersten Aufruf das lokale HTTPS-Stammzertifikat über die Seitenleiste beziehen. Dann die Minecraft-Verwaltung auf demselben HAOS-Gerät öffnen.
-3. In der Oberfläche zwei Java-Profile `modpack-a` und `modpack-b` einrichten und CurseForge-Packs auswählen. Spieler verbinden sich mit der HAOS-Adresse auf **25565/TCP**.
+Den **CurseForge API Key** in DiscoPanel unter **Global Settings** speichern. Gib dort den Schlüssel aus der [CurseForge-Konsole](https://console.curseforge.com/#/api-keys) ein. Suche danach unter **Modpacks → CurseForge**. Für die Abfragen und Downloads benötigt HAOS ausgehendes HTTPS über TCP 443. Für CurseForge ist keine Portweiterleitung am Router nötig. Manche Mods haben vom Anbieter gesperrte automatische Downloads. DiscoPanel beziehungsweise das Serverprotokoll zeigt dir dann, welche Dateien du manuell hochladen musst. [DiscoPanel-Dokumentation](https://docs.discopanel.app/guides/modpacks/)
 
-[Einrichtung, Ports und Backup](mcmodsgui/DOCS.md) · [Versionshinweise](mcmodsgui/CHANGELOG.md)
+Erstelle einen Vanilla-Server unter **Servers → New Server** oder wähle ein Modpack unter **Modpacks**. Neue Server starten standardmäßig erst auf deinen Klick. Wenn ein Server bereits läuft, klickst du beim anderen auf **Start** und bestätigst den Wechsel. Das Panel wartet auf die Beendigung des bisherigen Containers. Wenn beide aus sein sollen, klicke beim laufenden Server auf **Stop**. Lass **Auto Start** für beide aus, wenn nach einem Add-on-Neustart beide aus bleiben sollen.
 
-## Zugriff und Architektur
+Der Standard ist **4 GiB Java-Heap** und **5 GiB hartes Docker-Limit** ohne zusätzlichen Swap. Stelle für 5 oder 6 GiB Heap das Docker-Limit am jeweiligen Server auf 6144 oder 7168 MiB. Die zusätzlichen 1024 MiB sind für JVM- und Container-Overhead reserviert.
 
-Die App nutzt `docker_api: true`. Wie bei Portainer bietet der Socket der App bei ausgeschaltetem Schutzmodus technisch Kontrolle über die Host-Docker-Engine. Die App bekommt keine zusätzlich angeforderten Linux-Capabilities, keine Home-Assistant-API und keine Host-Netzwerkfreigabe. Der Supervisor verwaltet das Panel; das Panel verwaltet seine Minecraft- und Backup-Container auf demselben Host. Der Minecraft-Container bekommt keinen Docker-Socket.
-
-Die App erzeugt 4 GiB maximalen Java-Heap und 5 GiB tatsächliches Container-RAM-Limit. Der Startschutz lässt genau einen Minecraft-Container der App gleichzeitig zu. Der zweite Server startet erst, wenn der vorherige seine Welt gespeichert hat und beendet ist. Die Daten liegen im HAOS-App-Datenmount und bleiben über Updates erhalten. Für einen Produktivtest zuerst getrennte Testwelten verwenden.
-
-Das Repository ist eigenständig. Die GUI und der Servercode basieren auf Minepanel v1.13.44 von Ketbome sowie der lokalen Anpassung für exklusive Profile. Quellcode und Lizenzhinweise liegen vollständig bei. [AGPL-3.0](mcmodsgui/LICENSE) · [Upstream](https://github.com/Ketbome/minepanel)
+[Details zu Daten, Backups und Update](mcmodsgui/DOCS.md) · [Änderungen](mcmodsgui/CHANGELOG.md) · [DiscoPanel-Quellprojekt](https://github.com/discohaus/discopanel)

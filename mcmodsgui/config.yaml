@@ -1,6 +1,6 @@
-name: "MCPanelHAOS"
-description: "Verwaltet Minecraft-Java-Modserver direkt auf diesem HAOS. Docker-Zugriff nach Deaktivierung des Schutzmodus erforderlich."
-version: "1.0.0"
+name: MCPanelHAOS
+description: DiscoPanel für Minecraft-Java-Modserver auf diesem Home Assistant OS
+version: "2.0.0"
 slug: mcmodsgui
 arch:
   - amd64
@@ -8,7 +8,7 @@ stage: experimental
 startup: application
 boot: manual
 init: true
-timeout: 290
+timeout: 165
 docker_api: true
 ingress: true
 ingress_port: 8099
@@ -17,7 +17,7 @@ panel_icon: mdi:minecraft
 panel_admin: true
 webui: "https://[HOST]:[PORT:8443]"
 ports:
-  8443/tcp: 8443
+  8443/tcp: 18443
 ports_description:
   8443/tcp: "HTTPS der Minecraft-Verwaltung"
 map:
@@ -26,7 +26,7 @@ map:
 backup: cold
 options:
   panel_hostname: homeassistant.local
-  panel_port: 8443
+  panel_port: 18443
 schema:
   panel_hostname: str
   panel_port: "int(1,65535)"

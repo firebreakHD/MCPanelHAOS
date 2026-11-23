@@ -1,7 +1,0 @@
-configuration:
-  panel_hostname:
-    name: Adresse dieses Home-Assistant-Geräts
-    description: DNS-Name oder IPv4-Adresse dieses HAOS-Geräts für das HTTPS-Zertifikat.
-  panel_port:
-    name: HTTPS-Port der Verwaltung
-    description: Muss dem veröffentlichten Port für 8443/TCP entsprechen.

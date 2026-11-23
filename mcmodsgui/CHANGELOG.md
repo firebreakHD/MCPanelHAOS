@@ -1,9 +1,11 @@
 # Änderungen
 
-## 1.0.0
+## 2.0.0
 
-- Eigenständiges HAOS-Add-on mit Minepanel und lokalem Minecraft-Betrieb.
-- Zwei getrennte Java-Profile mit exklusivem Start, sauberem Wechsel und gemeinsamem Port 25565.
-- CurseForge, Live-Konsole, Dateimanager, Messwerte und Backups aus Minepanel.
-- 4 GiB Java-Heap als Vorgabe und 5 GiB hartes Minecraft-Containerlimit.
-- Deutscher Startbildschirm in Home Assistant mit Link auf die HTTPS-Verwaltung desselben Geräts.
+- Ersetzt Minepanel durch DiscoPanel 2.0.15. Add-on-ID und Repository bleiben für das Update gleich.
+- Serverprofile mit frei wählbaren Namen und separaten Weltordnern.
+- Exklusiver Serverbetrieb mit gemeinsamem Minecraft-Port 25565 und bestätigtem Wechsel über die GUI.
+- 4–6 GiB Java-Heap und 5–7 GiB Docker-Speicherlimit ohne zusätzlichen Swap.
+- Native CurseForge-Integration mit API-Schlüssel aus den globalen DiscoPanel-Einstellungen.
+- HTTPS-Port 18443 für Neuinstallationen.
+- Neue DiscoPanel-Datenstruktur. Für Weltübernahme und Rollback siehe [Dokumentation](DOCS.md).

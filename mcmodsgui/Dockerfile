@@ -1,49 +1,56 @@
-# Fullstack image (backend + frontend under supervisord). Build context is the repo root.
-FROM node:24-alpine AS base
+ARG APP_VERSION=2.0.15
 
-ENV HUSKY=0 CI=true NEXT_TELEMETRY_DISABLED=1
-RUN corepack enable
+# Generate protobuf code using buf
+FROM bufbuild/buf:1.57.2 AS proto-builder
+WORKDIR /app
+COPY buf.yaml buf.gen.yaml buf.lock ./
+COPY proto/ ./proto/
+RUN mkdir -p web/discopanel/static pkg/proto web/discopanel/src/lib/proto && buf generate
+
+FROM node:22-alpine AS frontend-builder
+
+ARG APP_VERSION
+ENV APP_VERSION=${APP_VERSION}
+
+WORKDIR /app/web/discopanel
+
+COPY web/discopanel/package*.json ./
+RUN npm ci
+
+COPY web/discopanel/ ./
+COPY --from=proto-builder /app/web/discopanel/src/lib/proto ./src/lib/proto/
+COPY --from=proto-builder /app/web/discopanel/static/schemav1.yaml ./static/
+
+RUN npm run build
+
+FROM golang:1.25-alpine AS backend-builder
+
+ARG APP_VERSION
+ENV APP_VERSION=${APP_VERSION}
+
+RUN apk add --no-cache gcc musl-dev sqlite-dev
 
 WORKDIR /app
 
-FROM base AS builder
+COPY go.mod go.sum ./
+RUN go mod download
 
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY backend/package.json backend/
-COPY frontend/package.json frontend/
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile --filter ./backend --filter ./frontend
+COPY . .
+COPY --from=proto-builder /app/pkg/proto ./pkg/proto/
+COPY --from=frontend-builder /app/web/discopanel/build ./web/discopanel/build
 
-COPY backend/ backend/
-COPY frontend/ frontend/
+RUN CGO_ENABLED=1 GOOS=linux go build -o discopanel ./cmd/discopanel
 
-RUN pnpm --filter ./backend build && pnpm --filter ./frontend build:turbopack
-RUN pnpm --filter ./backend --prod --legacy deploy /out/backend
-
-FROM base AS runner
-
-RUN apk add --no-cache caddy docker-cli docker-cli-compose supervisor
+FROM alpine:3.23
+ARG APP_VERSION=2.0.15
 ARG BUILD_ARCH=amd64
 ARG BUILD_VERSION
 LABEL io.hass.type="app" io.hass.arch="$BUILD_ARCH" io.hass.version="$BUILD_VERSION"
-ENV APP_VERSION=$BUILD_VERSION \
-    NODE_ENV=production \
-    DOCKER_HOST=unix:///run/docker.sock \
-    MINEPANEL_HAOS=true \
-    MINEPANEL_EXCLUSIVE_JAVA=true \
-    COMPOSE_PROJECT=mcmodsgui-haos \
-    NEXT_PUBLIC_BACKEND_URL=/backend \
-    NEXT_PUBLIC_DEFAULT_LANGUAGE=de \
-    XDG_DATA_HOME=/app/data/caddy \
-    XDG_CONFIG_HOME=/app/data/caddy-config
-
-RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nextjs
-WORKDIR /opt/minepanel
-COPY --from=builder /out/backend ./backend
-COPY --from=builder --chown=nextjs:nodejs /app/frontend/.next/standalone ./
-COPY --from=builder --chown=nextjs:nodejs /app/frontend/.next/static ./frontend/.next/static
-COPY --from=builder --chown=nextjs:nodejs /app/frontend/public ./frontend/public
+ENV APP_VERSION=$APP_VERSION MCPANEL_HAOS=true
+RUN apk add --no-cache ca-certificates sqlite-libs caddy docker-cli jq supervisor
+WORKDIR /opt/discopanel
+COPY --from=backend-builder /app/discopanel ./discopanel
 COPY haos/ ./haos/
-RUN chmod 755 /opt/minepanel/haos/start.sh
+RUN chmod 755 /opt/discopanel/haos/start.sh
 EXPOSE 8099 8443
-CMD ["/opt/minepanel/haos/start.sh"]
+CMD ["/opt/discopanel/haos/start.sh"]
