@@ -1,5 +1,9 @@
 # Änderungen
 
+## 2.0.1
+
+- Stopp und Serverwechsel warten bei der Ersteinrichtung auf den Start der Minecraft-Laufzeit. Dadurch erreicht das Stoppsignal den Java-Shutdown-Handler.
+
 ## 2.0.0
 
 - Ersetzt Minepanel durch DiscoPanel 2.0.15. Add-on-ID und Repository bleiben für das Update gleich.

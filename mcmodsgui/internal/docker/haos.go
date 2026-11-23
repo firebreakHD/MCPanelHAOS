@@ -113,6 +113,19 @@ func (c *Client) stopHAOSContainer(ctx context.Context, id string) error {
 	if info.Config == nil || info.Config.Labels[haosLabel] != os.Getenv("MCPANEL_HAOS_INSTALLATION") || info.Config.Labels[haosLabel] == "" {
 		return errors.New("Dieser Container gehört nicht zu dieser MCPanelHAOS-Installation.")
 	}
+	// During image provisioning the Java shutdown handler is not installed
+	// yet. An early TERM can be swallowed by the init shell.
+	for info.State != nil && info.State.Running && !info.State.Paused && info.State.Health != nil && info.State.Health.Status == "starting" {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("Der Minecraft-Start läuft noch. Der Stopp kann danach wiederholt werden: %w", ctx.Err())
+		case <-time.After(2 * time.Second):
+		}
+		info, err = c.docker.ContainerInspect(ctx, id)
+		if err != nil {
+			return err
+		}
+	}
 	if info.State == nil {
 		return errors.New("Docker meldet keinen Containerstatus.")
 	}
