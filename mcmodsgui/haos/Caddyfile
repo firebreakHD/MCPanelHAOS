@@ -1,0 +1,31 @@
+{
+	auto_https disable_redirects
+	skip_install_trust
+}
+
+https://{$PANEL_HOST}:8443 {
+	tls internal
+	handle_path /backend/* {
+		reverse_proxy 127.0.0.1:8091
+	}
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
+}
+
+http://:8099 {
+	@supervisor remote_ip 172.30.32.2
+	handle @supervisor {
+		handle /ca.crt {
+			root * /app/data/caddy/caddy/pki/authorities/local
+			rewrite * /root.crt
+			header Content-Disposition "attachment; filename=MCPanelHAOS-CA.crt"
+			file_server
+		}
+		handle {
+			root * /app/data/haos-web
+			file_server
+		}
+	}
+	respond 403
+}

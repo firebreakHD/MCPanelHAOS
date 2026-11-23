@@ -1,0 +1,93 @@
+import { Test, TestingModule } from '@nestjs/testing';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import { IntegrationSettingsController } from './integration-settings.controller';
+import { InstanceSettingsService } from 'src/settings/instance-settings.service';
+import { NotificationsService } from 'src/notifications/notifications.service';
+import { AuthMailService } from 'src/auth/auth-mail.service';
+import { UsersService } from '../services/users.service';
+import { AccessControlService } from '../services/access-control.service';
+import { AuditLogService } from '../services/audit-log.service';
+
+describe('IntegrationSettingsController', () => {
+  let controller: IntegrationSettingsController;
+  let instanceSettings: { getPublic: jest.Mock; updateIntegrations: jest.Mock; getOidc: jest.Mock };
+  let usersService: { getRequestUser: jest.Mock; hasSsoCapableAdmin: jest.Mock };
+  let auditLogService: { record: jest.Mock };
+  let authMailService: { sendTestEmail: jest.Mock };
+  let notifications: { testChannel: jest.Mock; getDeliveryState: jest.Mock; isDiscordConfigured: jest.Mock };
+
+  beforeEach(async () => {
+    instanceSettings = {
+      getPublic: jest.fn(async () => ({ smtp: {}, oidc: {} })),
+      updateIntegrations: jest.fn(async () => ({ smtp: {}, oidc: {} })),
+      getOidc: jest.fn(async () => ({ disablePasswordLogin: false })),
+    };
+    usersService = { getRequestUser: jest.fn(), hasSsoCapableAdmin: jest.fn(async () => true) };
+    auditLogService = { record: jest.fn() };
+    authMailService = { sendTestEmail: jest.fn() };
+    notifications = { isDiscordConfigured: jest.fn().mockResolvedValue(false), getDeliveryState: jest.fn().mockReturnValue({}), testChannel: jest.fn().mockResolvedValue({ success: true }) };
+
+    const module: TestingModule = await Test.createTestingModule({
+      controllers: [IntegrationSettingsController],
+      providers: [
+        AccessControlService,
+        { provide: InstanceSettingsService, useValue: instanceSettings },
+        { provide: UsersService, useValue: usersService },
+        { provide: AuditLogService, useValue: auditLogService },
+        { provide: AuthMailService, useValue: authMailService },
+        { provide: NotificationsService, useValue: notifications },
+      ],
+    }).compile();
+
+    controller = module.get(IntegrationSettingsController);
+  });
+
+  it('rejects non-admin users', async () => {
+    usersService.getRequestUser.mockResolvedValue({ id: 2, role: 'USER' });
+    await expect(controller.getIntegrations({ user: { userId: 2 } } as any)).rejects.toBeInstanceOf(ForbiddenException);
+    expect(instanceSettings.getPublic).not.toHaveBeenCalled();
+  });
+
+  it('returns masked settings for admins', async () => {
+    usersService.getRequestUser.mockResolvedValue({ id: 1, role: 'ADMIN' });
+    const result = await controller.getIntegrations({ user: { userId: 1 } } as any);
+    expect(result).toEqual({ smtp: {}, oidc: {}, notificationDelivery: {}, systemDiscordConfigured: false });
+    expect(instanceSettings.getPublic).toHaveBeenCalled();
+  });
+
+  it('updates integrations and records an audit entry', async () => {
+    usersService.getRequestUser.mockResolvedValue({ id: 1, role: 'ADMIN' });
+    await controller.updateIntegrations({ user: { userId: 1, username: 'admin' } } as any, { smtp: { host: 'x' } });
+    expect(instanceSettings.updateIntegrations).toHaveBeenCalledWith({ smtp: { host: 'x' } });
+    expect(auditLogService.record).toHaveBeenCalledWith(expect.objectContaining({ action: 'update_integrations' }));
+  });
+
+  it('refuses to disable password login while no admin is linked to the provider', async () => {
+    usersService.getRequestUser.mockResolvedValue({ id: 1, role: 'ADMIN' });
+    usersService.hasSsoCapableAdmin.mockResolvedValue(false);
+
+    await expect(
+      controller.updateIntegrations({ user: { userId: 1, username: 'admin' } } as any, { oidc: { disablePasswordLogin: true } }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(instanceSettings.updateIntegrations).not.toHaveBeenCalled();
+  });
+
+  it('allows disabling password login once an admin can sign in through SSO', async () => {
+    usersService.getRequestUser.mockResolvedValue({ id: 1, role: 'ADMIN' });
+    usersService.hasSsoCapableAdmin.mockResolvedValue(true);
+
+    await controller.updateIntegrations({ user: { userId: 1, username: 'admin' } } as any, { oidc: { disablePasswordLogin: true } });
+    expect(instanceSettings.updateIntegrations).toHaveBeenCalledWith({ oidc: { disablePasswordLogin: true } });
+  });
+  it('rejects notification tests for non-admins', async () => {
+    usersService.getRequestUser.mockResolvedValue({ id: 2, role: 'USER' });
+    await expect(controller.testNotification({ user: { userId: 2 } }, { channel: 'telegram' })).rejects.toBeInstanceOf(ForbiddenException);
+    expect(notifications.testChannel).not.toHaveBeenCalled();
+  });
+
+  it('tests the saved destination for admins', async () => {
+    usersService.getRequestUser.mockResolvedValue({ id: 1, role: 'ADMIN' });
+    await expect(controller.testNotification({ user: { userId: 1 } }, { channel: 'email' })).resolves.toEqual({ success: true });
+    expect(notifications.testChannel).toHaveBeenCalledWith('email');
+  });
+});

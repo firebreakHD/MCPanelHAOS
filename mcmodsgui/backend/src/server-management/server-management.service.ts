@@ -1,0 +1,2612 @@
+import { NotificationsService } from 'src/notifications/notifications.service';
+import { ConflictException, BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { exec, execFile, spawn } from 'node:child_process';
+import type { ExecOptions, SpawnOptionsWithoutStdio } from 'node:child_process';
+import { promisify } from 'node:util';
+import * as path from 'node:path';
+import * as fs from 'fs-extra';
+import * as yaml from 'js-yaml';
+import { InjectRepository } from '@nestjs/typeorm';
+import { PlayerSession, PlayerTracking } from 'src/player-activity/entities/player-session.entity';
+import { Repository, Not, IsNull } from 'typeorm';
+import { Settings } from 'src/users/entities/settings.entity';
+import { Users } from 'src/users/entities/users.entity';
+import { UserInvitation } from 'src/users/entities/user-invitation.entity';
+import { UptimeInterval } from 'src/metrics/entities/uptime-interval.entity';
+import { MetricSample } from 'src/metrics/entities/metric-sample.entity';
+import { LogPreset } from 'src/log-presets/entities/log-preset.entity';
+import { ScheduledTask } from 'src/scheduled-tasks/entities/scheduled-task.entity';
+import { ServerEventType, SupportedLanguage } from 'src/discord/discord.service';
+import { ConfigService } from '@nestjs/config';
+import { ServerConfig, ServerEdition, SHUTDOWN_BUFFER_SECONDS } from './dto/server-config.model';
+import { AlertsService, EXPECTED_STOP_WINDOW_MS } from 'src/alerts/alerts.service';
+import { ServerStoreService } from 'src/docker-compose/server-store.service';
+import { InstanceSettingsService } from 'src/settings/instance-settings.service';
+import { DockerComposeService } from 'src/docker-compose/docker-compose.service';
+import { VelocityForwardingService } from 'src/proxy/velocity-forwarding.service';
+import { getComposeLabel, getComposeLabelFlag } from 'src/common/compose/compose-labels';
+import { MinecraftStatusProbe, parseMinecraftStatus } from './minecraft-status.util';
+import { assertContained } from 'src/common/fs/contained-path';
+import { isVelocityBackend } from 'src/proxy/velocity-backend';
+import { containerMemoryLimit } from 'src/common/compose/container-memory';
+import { assertExclusiveProfile, EXCLUSIVE_MC_CONTAINER, EXCLUSIVE_MC_PROFILES, exclusiveJavaEnabled, ExclusiveJavaOperation, HAOS_MC_LABEL } from './exclusive-java';
+
+const execAsync = promisify(exec);
+const execDocker = (args: string[]) => promisify(execFile)('docker', args, { timeout: DOCKER_READ_TIMEOUT_MS });
+
+// Read-only docker calls behind the polls get a deadline, so a hung daemon cannot pile up
+// one stuck process per poll. Commands that change state (compose up/down) have none:
+// an image pull can legitimately take minutes.
+const DOCKER_READ_TIMEOUT_MS = 15_000;
+const execRead = (command: string, options: ExecOptions = {}) => execAsync(command, { timeout: DOCKER_READ_TIMEOUT_MS, ...options, encoding: 'utf8' });
+
+export type ServerDeletionGuard = (serverId: string) => Promise<() => void>;
+
+const DOCKER_COMMANDS = {
+  COMPOSE_DOWN: (timeout: number) => `docker compose down --timeout ${timeout}`,
+  COMPOSE_UP: 'docker compose up -d',
+  COMPOSE_PS_SERVICE: 'docker compose ps -aq mc',
+  PS_FILTER: (serverId: string) => `docker ps -a --filter "name=^/${serverId}$" --format "{{.ID}}"`,
+  PS_PARTIAL: (serverId: string) => `docker ps -a --filter "name=${serverId}" --format "{{.ID}}"`,
+  INSPECT_STATUS: (containerId: string) => `docker inspect --format="{{.State.Status}}" ${containerId}`,
+  INSPECT_STATUSES: (containerIds: string[]) => `docker inspect --format="{{.Id}} {{.State.Status}}" ${containerIds.join(' ')}`,
+  INSPECT_EXIT_CODE: (containerId: string) => `docker inspect --format="{{.State.ExitCode}}" ${containerId}`,
+  STATS_ONE: (containerId: string) => String.raw`docker stats ${containerId} --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}"`,
+  // Single command to get all running containers stats at once (much faster)
+  STATS_ALL: String.raw`docker stats --no-stream --format "{{.Container}}\t{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"`,
+  LOGS: (containerId: string, lines: number) => `docker logs --tail ${lines} --timestamps ${containerId} 2>&1`,
+  // Bedrock: TODO - commands disabled due to TTY/permission issues with send-command
+  EXEC_BEDROCK: (_containerId: string, _command: string) => {
+    return `echo "Commands not supported for Bedrock servers yet"`;
+  },
+  RESTIC_SNAPSHOTS: (serverId: string) => `docker exec ${serverId}-backup restic snapshots --json`,
+  // `name=` matches substrings, so it would also catch other stacks' volumes.
+  VOLUME_LIST: (project: string) => `docker volume ls --filter "label=com.docker.compose.project=${project}" --format "{{.Name}}"`,
+  VOLUME_REMOVE: (volume: string) => `docker volume rm ${volume}`,
+  DU_SIZE: (worldPath: string) => `du -sb "${worldPath}" | cut -f1`,
+} as const;
+
+export type ServerStatus = 'running' | 'stopped' | 'starting' | 'not_found';
+
+interface ExclusiveSlot {
+  id: string;
+  profile: string;
+  status: string;
+}
+
+export interface ServerResourceInfo {
+  status: ServerStatus;
+  cpuUsage: string;
+  memoryUsage: string;
+  memoryLimit: string;
+  cpuLimit: string;
+  memoryConfigLimit: string;
+}
+
+export interface ServerRuntimeStats extends ServerResourceInfo {
+  playersOnline: number | null;
+  playersMax: number | null;
+  uptimeSeconds: number | null;
+  version: string | null;
+  gameReachable: boolean;
+  gameQueryStatus: 'healthy' | 'failed' | 'unknown';
+}
+
+interface GameProbeResult { value: MinecraftStatusProbe | null; status: 'healthy' | 'failed' | 'unknown' }
+
+export interface ServerInfo {
+  exists: boolean;
+  status: ServerStatus;
+  dockerComposeExists?: boolean;
+  mcDataExists?: boolean;
+  worldSize?: number;
+  lastUpdated?: Date | null;
+  worldSizeFormatted?: string;
+  error?: string;
+}
+
+export interface ServerLogsResponse {
+  logs: string;
+  hasErrors: boolean;
+  lastUpdate: Date;
+  status: ServerStatus;
+  metadata?: {
+    totalLines: number;
+    errorCount: number;
+    warningCount: number;
+  };
+  hasNewContent?: boolean;
+}
+
+export interface CommandExecutionResponse {
+  success: boolean;
+  output: string;
+}
+
+export interface ResticSnapshot {
+  id: string;
+  shortId: string;
+  time: string;
+  paths: string[];
+  tags: string[];
+  hostname: string;
+}
+
+export interface BackupSnapshotsResponse {
+  success: boolean;
+  snapshots: ResticSnapshot[];
+  error?: string;
+}
+
+export interface AvailableWorld {
+  name: string;
+  source: string;
+  scope: 'local' | 'global';
+  type: 'directory' | 'archive';
+  defaultLevelName: string;
+  displayPath: string;
+  selected: boolean;
+  copied: boolean;
+}
+
+// Java 1.21.11+ game rule registry (minecraft.wiki/w/Game_rule). Only used when the server's
+// `help gamerule` does not list rules; rules a version lacks just fail to answer and are skipped.
+const REGISTRY_GAMERULES = [
+  'advance_time', 'advance_weather', 'allow_entering_nether_using_portals', 'block_drops', 'block_explosion_drop_decay', 'command_block_output',
+  'command_blocks_work', 'drowning_damage', 'elytra_movement_check', 'ender_pearls_vanish_on_death', 'entity_drops', 'fall_damage', 'fire_damage',
+  'fire_spread_radius_around_player', 'forgive_dead_players', 'freeze_damage', 'global_sound_events', 'immediate_respawn', 'keep_inventory',
+  'lava_source_conversion', 'limited_crafting', 'locator_bar', 'log_admin_commands', 'max_block_modifications', 'max_command_forks',
+  'max_command_sequence_length', 'max_entity_cramming', 'max_minecart_speed', 'max_snow_accumulation_height', 'mob_drops', 'mob_explosion_drop_decay',
+  'mob_griefing', 'natural_health_regeneration', 'player_movement_check', 'players_nether_portal_creative_delay', 'players_nether_portal_default_delay',
+  'players_sleeping_percentage', 'projectiles_can_break_blocks', 'pvp', 'raids', 'random_tick_speed', 'reduced_debug_info', 'respawn_radius',
+  'send_command_feedback', 'show_advancement_messages', 'show_death_messages', 'spawn_mobs', 'spawn_monsters', 'spawn_patrols', 'spawn_phantoms',
+  'spawn_wandering_traders', 'spawn_wardens', 'spawner_blocks_work', 'spectators_generate_chunks', 'spread_vines', 'tnt_explodes',
+  'tnt_explosion_drop_decay', 'universal_anger', 'water_source_conversion',
+];
+
+@Injectable()
+export class ServerManagementService {
+  private readonly deletionGuards = new Set<ServerDeletionGuard>();
+  private readonly deletingServers = new Set<string>();
+
+  registerDeletionGuard(guard: ServerDeletionGuard): () => void {
+    this.deletionGuards.add(guard);
+    return () => { this.deletionGuards.delete(guard); };
+  }
+
+  private readonly logger = new Logger(ServerManagementService.name);
+  private readonly SERVERS_DIR: string;
+  private readonly SERVERS_HOST_DIR: string;
+  private readonly SERVERS_HOST_DIR_IS_A_GUESS: boolean;
+  private readonly COMPOSE_PROJECT?: string;
+  private readonly RESERVED_SERVER_DIRS = new Set(['.world']);
+
+  private readonly exclusiveOperation = new ExclusiveJavaOperation();
+  private readonly FORCE_STOP_POLL_ATTEMPTS = 30;
+  private readonly FORCE_STOP_POLL_INTERVAL_MS = 500;
+  private readonly FORCE_STOP_GRACE_SECONDS = 10;
+
+  // Home (15s) and the server page (10s) both poll runtime stats, often from several
+  // tabs: share one `docker exec` probe per server instead of multiplying them.
+  private readonly STATUS_PROBE_TTL_MS = 8_000;
+  private readonly statusProbeCache = new Map<string, { at: number; value: GameProbeResult }>();
+  private readonly statusProbeInFlight = new Map<string, Promise<GameProbeResult>>();
+
+  // Every status, stats and logs poll needs the container id, and resolving it runs
+  // `docker compose ps`. The id only changes when compose recreates the container, which
+  // goes through execComposeCommand and drops the entry; the TTL covers changes made
+  // outside the panel.
+  private readonly CONTAINER_ID_TTL_MS = 30_000;
+  private readonly containerIdCache = new Map<string, { at: number; id: Promise<string> }>();
+
+  // Modpack first boots can take well over ten minutes before the server accepts players.
+  private readonly READY_POLL_INTERVAL_MS = 5_000;
+  private readonly READY_TIMEOUT_MS = 20 * 60_000;
+  private readonly readyWatches = new Map<string, number>();
+
+  constructor(
+    private readonly configService: ConfigService,
+    @InjectRepository(Settings)
+    private readonly settingsRepo: Repository<Settings>,
+    private readonly notificationsService: NotificationsService,
+    private readonly alertsService: AlertsService,
+    private readonly store: ServerStoreService,
+    private readonly instanceSettings: InstanceSettingsService,
+    private readonly composeService: DockerComposeService,
+    private readonly velocityForwarding: VelocityForwardingService,
+  ) {
+    this.SERVERS_DIR = this.configService.get('serversDir');
+    this.SERVERS_HOST_DIR = this.configService.get('serversHostDir');
+    this.SERVERS_HOST_DIR_IS_A_GUESS = (this.configService.get<string[]>('unresolvedHostPaths') ?? []).includes('/app/servers');
+    this.COMPOSE_PROJECT = this.readComposeProject();
+    fs.ensureDirSync(this.SERVERS_DIR);
+    fs.ensureDirSync(this.getGlobalWorldsPath());
+  }
+
+  // Writes server.json directly rather than through DockerComposeService.updateServerConfig,
+  // which regenerates the compose file and would move a running server's published port.
+  async updateModWatch(serverId: string, update: { targetVersion?: string | null; notes?: Record<string, string> }): Promise<ServerConfig> {
+    if (!this.validateServerId(serverId)) {
+      throw new BadRequestException(`Invalid server ID: ${serverId}`);
+    }
+
+    const config = await this.store.updateConfig(serverId, (current) => {
+      if (update.targetVersion !== undefined) {
+        const trimmed = update.targetVersion?.trim();
+        current.modWatchTargetVersion = trimmed ? trimmed : undefined;
+      }
+      if (update.notes !== undefined) {
+        const kept = Object.entries(update.notes).filter(([, note]) => note.trim().length > 0);
+        current.modNotes = kept.length > 0 ? Object.fromEntries(kept) : undefined;
+      }
+    });
+
+    if (!config) {
+      throw new NotFoundException(`Server with ID "${serverId}" not found`);
+    }
+    return config;
+  }
+
+  // Writes server.json directly, like updateModWatch: the Metrics tab stays open while the
+  // server runs, so this write must not regenerate the compose file. An empty value clears it.
+  async updateTickCommand(serverId: string, update: { tickCommand?: string; tickTpsPattern?: string; tickMsptPattern?: string }): Promise<ServerConfig> {
+    if (!this.validateServerId(serverId)) {
+      throw new BadRequestException(`Invalid server ID: ${serverId}`);
+    }
+
+    const config = await this.store.updateConfig(serverId, (current) => {
+      current.tickCommand = update.tickCommand?.trim() || undefined;
+      current.tickTpsPattern = current.tickCommand ? update.tickTpsPattern?.trim() || undefined : undefined;
+      current.tickMsptPattern = current.tickCommand && current.tickTpsPattern ? update.tickMsptPattern?.trim() || undefined : undefined;
+    });
+
+    if (!config) {
+      throw new NotFoundException(`Server with ID "${serverId}" not found`);
+    }
+    return config;
+  }
+
+  // Writes server.json directly, like updateModWatch: the Players/Commands tabs stay open
+  // while the server runs, so this write must not regenerate the compose file.
+  async updateSpawnPoint(serverId: string, update: { x?: number | null; y?: number | null; z?: number | null }): Promise<ServerConfig> {
+    if (!this.validateServerId(serverId)) {
+      throw new BadRequestException(`Invalid server ID: ${serverId}`);
+    }
+
+    const config = await this.store.updateConfig(serverId, (current) => {
+      if (update.x !== undefined) current.spawnX = update.x ?? undefined;
+      if (update.y !== undefined) current.spawnY = update.y ?? undefined;
+      if (update.z !== undefined) current.spawnZ = update.z ?? undefined;
+    });
+
+    if (!config) {
+      throw new NotFoundException(`Server with ID "${serverId}" not found`);
+    }
+    return config;
+  }
+
+  private validateServerId(serverId: string): boolean {
+    return /^[a-zA-Z0-9_-]+$/.test(serverId);
+  }
+
+  private async serverExists(serverId: string): Promise<boolean> {
+    return fs.pathExists(path.join(this.SERVERS_DIR, serverId));
+  }
+
+  private getDockerComposePath(serverId: string): string {
+    return path.join(this.SERVERS_DIR, serverId, 'docker-compose.yml');
+  }
+
+  private getMcDataPath(serverId: string): string {
+    return path.join(this.SERVERS_DIR, serverId, 'mc-data');
+  }
+
+  private getWorldsPath(serverId: string): string {
+    return path.join(this.SERVERS_DIR, serverId, 'worlds');
+  }
+
+  private getLegacyWorldsPath(serverId: string): string {
+    return path.join(this.getMcDataPath(serverId), 'worlds');
+  }
+
+  private getGlobalWorldsPath(): string {
+    return path.join(this.SERVERS_DIR, '.world', 'worlds');
+  }
+
+  private sanitizeLevelName(input: string): string {
+    const trimmed = input.trim();
+    if (!trimmed) return 'world';
+    return trimmed.replaceAll(/[\\/]/g, '').trim() || 'world';
+  }
+
+  private getDefaultLevelNameFromSource(source: string): string {
+    return source
+      .replace(/\.tar\.gz$/i, '')
+      .replace(/\.tgz$/i, '')
+      .replace(/\.tar$/i, '')
+      .replace(/\.zip$/i, '');
+  }
+
+  private isSupportedWorldArchive(fileName: string): boolean {
+    return /\.(zip|tar|tar\.gz|tgz)$/i.test(fileName);
+  }
+
+  private async hasLevelDat(worldPath: string): Promise<boolean> {
+    const directLevelDat = path.join(worldPath, 'level.dat');
+    return fs.pathExists(directLevelDat);
+  }
+
+  private async worldWasCopied(serverId: string, levelName: string): Promise<boolean> {
+    const expectedLevelPath = path.join(this.getMcDataPath(serverId), levelName, 'level.dat');
+    return fs.pathExists(expectedLevelPath);
+  }
+
+  private async migrateLegacyWorldsIfNeeded(serverId: string): Promise<void> {
+    const localWorldsPath = this.getWorldsPath(serverId);
+    const legacyWorldsPath = this.getLegacyWorldsPath(serverId);
+
+    // mc-data belongs to the game container: a planted link here would make the
+    // panel move another server's data (or its own DB) into this world library.
+    const legacyStat = await fs.lstat(legacyWorldsPath).catch(() => null);
+    if (!legacyStat?.isDirectory()) return;
+
+    await fs.ensureDir(localWorldsPath);
+
+    const [legacyEntries, localEntries] = await Promise.all([fs.readdir(legacyWorldsPath), fs.readdir(localWorldsPath)]);
+
+    if (legacyEntries.length === 0 || localEntries.length > 0) return;
+
+    for (const entry of legacyEntries) {
+      const from = path.join(legacyWorldsPath, entry);
+      const to = path.join(localWorldsPath, entry);
+      if (await fs.pathExists(to)) continue;
+      if ((await fs.lstat(from)).isSymbolicLink()) continue;
+      await assertContained(this.getMcDataPath(serverId), from);
+      await fs.move(from, to);
+    }
+  }
+
+  private async collectWorldSources(basePath: string, relativePath = '', depth = 0): Promise<Array<{ source: string; name: string; type: 'directory' | 'archive'; displayPath: string }>> {
+    if (depth > 8) return [];
+
+    const entries = await fs.readdir(basePath, { withFileTypes: true });
+    const worlds: Array<{ source: string; name: string; type: 'directory' | 'archive'; displayPath: string }> = [];
+
+    for (const entry of entries) {
+      const entryRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+      const entryFullPath = path.join(basePath, entry.name);
+
+      if (entry.isDirectory()) {
+        if (await this.hasLevelDat(entryFullPath)) {
+          worlds.push({
+            source: entryRelativePath,
+            name: entry.name,
+            type: 'directory',
+            displayPath: entryRelativePath,
+          });
+          continue;
+        }
+
+        const nestedWorlds = await this.collectWorldSources(entryFullPath, entryRelativePath, depth + 1);
+        worlds.push(...nestedWorlds);
+        continue;
+      }
+
+      if (!entry.isFile() || !this.isSupportedWorldArchive(entry.name)) {
+        continue;
+      }
+
+      worlds.push({
+        source: entryRelativePath,
+        name: entry.name,
+        type: 'archive',
+        displayPath: entryRelativePath,
+      });
+    }
+
+    return worlds;
+  }
+
+  async listAvailableWorlds(
+    serverId: string,
+    selectedWorldSource = '',
+    selectedLevelName = 'world',
+    selectedWorldScope: 'local' | 'global' = 'local',
+  ): Promise<AvailableWorld[]> {
+    if (!this.validateServerId(serverId)) {
+      return [];
+    }
+
+    const localWorldsPath = this.getWorldsPath(serverId);
+    const globalWorldsPath = this.getGlobalWorldsPath();
+    await fs.ensureDir(localWorldsPath);
+    await fs.ensureDir(globalWorldsPath);
+    await this.migrateLegacyWorldsIfNeeded(serverId);
+
+    const localSources = await this.collectWorldSources(localWorldsPath);
+    const globalSources = await this.collectWorldSources(globalWorldsPath);
+    const worlds: AvailableWorld[] = [];
+
+    for (const candidate of localSources) {
+      const scope: 'local' | 'global' = 'local';
+      const defaultLevelName = this.getDefaultLevelNameFromSource(candidate.name);
+      const isSelected = selectedWorldSource === candidate.source && selectedWorldScope === scope;
+      const levelName = isSelected ? this.sanitizeLevelName(selectedLevelName) : defaultLevelName;
+
+      worlds.push({
+        name: candidate.name,
+        source: candidate.source,
+        scope,
+        type: candidate.type,
+        defaultLevelName,
+        displayPath: candidate.displayPath,
+        selected: isSelected,
+        copied: await this.worldWasCopied(serverId, levelName),
+      });
+    }
+
+    for (const candidate of globalSources) {
+      const scope: 'local' | 'global' = 'global';
+      const defaultLevelName = this.getDefaultLevelNameFromSource(candidate.name);
+      const isSelected = selectedWorldSource === candidate.source && selectedWorldScope === scope;
+      const levelName = isSelected ? this.sanitizeLevelName(selectedLevelName) : defaultLevelName;
+
+      worlds.push({
+        name: candidate.name,
+        source: candidate.source,
+        scope,
+        type: candidate.type,
+        defaultLevelName,
+        displayPath: candidate.displayPath,
+        selected: isSelected,
+        copied: await this.worldWasCopied(serverId, levelName),
+      });
+    }
+
+    worlds.sort((a, b) => a.displayPath.localeCompare(b.displayPath));
+    return worlds;
+  }
+
+  // A .env copied from an older .env.example held `COMPOSE_PROJECT=   # comment`, which Compose
+  // passes through as the value. Compose then rejects every start with "invalid project name".
+  private readComposeProject(): string | undefined {
+    const value = this.configService.get<string>('composeProject')?.trim();
+    if (!value) return undefined;
+    if (/^[a-z0-9][a-z0-9_-]*$/i.test(value)) return value;
+    this.logger.warn(`Ignoring COMPOSE_PROJECT: "${value}" is not a valid project name prefix (letters, digits, hyphens and underscores only). Move any comment on its own line in .env.`);
+    return undefined;
+  }
+
+  private getComposeProjectName(serverId: string): string | undefined {
+    if (process.env.MINEPANEL_HAOS === 'true') return `mcmodsgui-haos_${serverId}`;
+    if (exclusiveJavaEnabled()) return `minepanel-exclusive_${serverId}`;
+    if (!this.COMPOSE_PROJECT) return undefined;
+    return `${this.COMPOSE_PROJECT.toLowerCase()}_${serverId.toLowerCase()}`;
+  }
+
+  private getComposeExecOptions(serverId: string): ExecOptions {
+    const composeDir = path.dirname(this.getDockerComposePath(serverId));
+    const composeProjectName = this.getComposeProjectName(serverId);
+
+    if (!composeProjectName) {
+      return { cwd: composeDir };
+    }
+
+    return {
+      cwd: composeDir,
+      env: {
+        ...process.env,
+        COMPOSE_PROJECT_NAME: composeProjectName,
+      },
+    };
+  }
+
+  private async execComposeCommand(serverId: string, command: string) {
+    const composeCommand = exclusiveJavaEnabled() ? command.replace('docker compose ', 'docker compose -f docker-compose.yml ') : command;
+    if (command === DOCKER_COMMANDS.COMPOSE_PS_SERVICE) {
+      return execRead(composeCommand, this.getComposeExecOptions(serverId));
+    }
+    this.containerIdCache.delete(serverId);
+    try {
+      return await execAsync(composeCommand, this.getComposeExecOptions(serverId));
+    } finally {
+      this.containerIdCache.delete(serverId);
+    }
+  }
+
+  private parseComposeSeconds(value: unknown): number | undefined {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+    const match = /^(\d+)s?$/.exec(value.trim());
+    const seconds = match ? Number.parseInt(match[1], 10) : Number.NaN;
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+  }
+
+  // Compose defaults to 10s, which SIGKILLs Minecraft mid-announcement and loses the final save
+  private async getStopTimeout(serverId: string): Promise<number> {
+    try {
+      const content = await fs.readFile(this.getDockerComposePath(serverId), 'utf-8');
+      const mc = (yaml.load(content) as any)?.services?.mc;
+
+      const grace = this.parseComposeSeconds(mc?.stop_grace_period);
+      if (grace !== undefined) {
+        return grace;
+      }
+
+      const announceDelay = this.parseComposeSeconds(mc?.environment?.STOP_SERVER_ANNOUNCE_DELAY);
+      if (announceDelay !== undefined) {
+        return announceDelay + SHUTDOWN_BUFFER_SECONDS;
+      }
+    } catch (error) {
+      this.logger.warn(`Could not read stop timeout for ${serverId}, using default`, error);
+    }
+
+    return SHUTDOWN_BUFFER_SECONDS;
+  }
+
+  private async execComposeDown(serverId: string) {
+    return this.execComposeCommand(serverId, DOCKER_COMMANDS.COMPOSE_DOWN(await this.getStopTimeout(serverId)));
+  }
+
+  // Only for stops someone asked for (stop, restart, clear, delete). Start also runs `down` to
+  // recreate the container, but must not hide a crash during boot from alerts and uptime.
+  private async execPlannedComposeDown(serverId: string) {
+    const timeout = await this.getStopTimeout(serverId);
+    this.alertsService.markExpectedStop(serverId, timeout * 1000 + EXPECTED_STOP_WINDOW_MS);
+    try {
+      return await this.execComposeCommand(serverId, DOCKER_COMMANDS.COMPOSE_DOWN(timeout));
+    } finally {
+      // Leave a fresh observation window after slow shutdowns, even when Compose rejects.
+      this.alertsService.markExpectedStop(serverId);
+    }
+  }
+
+  private executeProcess(
+    command: string,
+    args: string[],
+    options?: SpawnOptionsWithoutStdio,
+  ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(command, args, {
+        ...options,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk.toString();
+      });
+
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString();
+      });
+
+      child.on('error', (error) => {
+        reject(error);
+      });
+
+      child.on('close', (exitCode) => {
+        resolve({ stdout, stderr, exitCode });
+      });
+    });
+  }
+
+  private stripAnsiEscapeSequences(text: string): string {
+    let result = '';
+
+    for (let index = 0; index < text.length; index++) {
+      const currentChar = text[index];
+      const currentCode = text.charCodeAt(index);
+
+      if (currentCode === 0x1b) {
+        const nextChar = text[index + 1];
+
+        // CSI sequence: ESC[
+        if (nextChar === '[') {
+          index += 2;
+          while (index < text.length) {
+            const code = text.charCodeAt(index);
+            // Final byte of CSI is in 0x40-0x7E.
+            if (code >= 0x40 && code <= 0x7e) {
+              break;
+            }
+            index++;
+          }
+          continue;
+        }
+
+        // OSC sequence: ESC]
+        if (nextChar === ']') {
+          index += 2;
+          while (index < text.length) {
+            const code = text.charCodeAt(index);
+            // BEL terminator.
+            if (code === 0x07) {
+              break;
+            }
+            // ST terminator (ESC \).
+            if (code === 0x1b && text[index + 1] === '\\') {
+              index++;
+              break;
+            }
+            index++;
+          }
+          continue;
+        }
+
+        // Generic ESC sequence: skip introducer + next byte.
+        if (index + 1 < text.length) {
+          index++;
+        }
+        continue;
+      }
+
+      result += currentChar;
+    }
+
+    return result;
+  }
+
+  private removeControlCharacters(text: string): string {
+    let sanitized = '';
+
+    for (const char of text) {
+      const code = char.charCodeAt(0);
+      const isControl = (code >= 0x00 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f);
+      if (!isControl) {
+        sanitized += char;
+      }
+    }
+
+    return sanitized;
+  }
+
+  private normalizeCommandInput(command: string): string {
+    const commandWithoutAnsi = this.stripAnsiEscapeSequences(command);
+    return this.removeControlCharacters(commandWithoutAnsi).trim();
+  }
+
+  private sanitizeCommandOutput(output: string): string {
+    const withoutAnsi = this.stripAnsiEscapeSequences(output);
+    return this.removeControlCharacters(withoutAnsi);
+  }
+
+  private tokenizeRconCommand(command: string): string[] {
+    const tokenPattern = /"([^"\\]|\\.)*"|'([^'\\]|\\.)*'|\S+/g;
+    const tokens = command.match(tokenPattern);
+    return tokens && tokens.length > 0 ? tokens : [command];
+  }
+
+  private isRconCommandError(output: string): boolean {
+    return /Incorrect argument for command|Unknown or incomplete command|Unknown command|commands\./i.test(output);
+  }
+
+  private convertGameruleToSnakeCase(command: string): string | null {
+    const tokens = this.tokenizeRconCommand(command);
+    if (tokens.length < 2 || tokens[0].toLowerCase() !== 'gamerule') {
+      return null;
+    }
+
+    const gamerule = tokens[1];
+    if (!/[A-Z]/.test(gamerule)) {
+      return null;
+    }
+
+    const snakeCaseGamerule = gamerule.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+    if (snakeCaseGamerule === gamerule) {
+      return null;
+    }
+
+    return ['gamerule', snakeCaseGamerule, ...tokens.slice(2)].join(' ');
+  }
+
+  private async executeRconWithFallback(
+    containerId: string,
+    rconPort: string,
+    rconPassword: string | undefined,
+    normalizedCommand: string,
+  ): Promise<CommandExecutionResponse> {
+    const baseArgs = ['exec', containerId, 'rcon-cli', '--port', rconPort];
+    if (rconPassword) {
+      baseArgs.push('--password', rconPassword);
+    }
+
+    const tokenizedCommand = this.tokenizeRconCommand(normalizedCommand);
+    const styles: string[][] = [tokenizedCommand];
+
+    // Some environments/architectures handle full command-as-single-arg more reliably.
+    if (tokenizedCommand.length > 1) {
+      styles.push([normalizedCommand]);
+    }
+
+    let lastError = 'Command execution failed';
+
+    for (const commandStyle of styles) {
+      const { stdout, stderr, exitCode } = await this.executeProcess('docker', [...baseArgs, ...commandStyle]);
+      const sanitizedStdout = this.sanitizeCommandOutput(stdout || '');
+      const sanitizedStderr = this.sanitizeCommandOutput(stderr || '');
+      const combinedOutput = (sanitizedStdout || sanitizedStderr || '').trim();
+
+      if (exitCode !== 0) {
+        lastError = combinedOutput || `rcon-cli exited with code ${exitCode}`;
+        continue;
+      }
+
+      if (this.isRconCommandError(combinedOutput)) {
+        lastError = combinedOutput || 'Command syntax rejected by server';
+        continue;
+      }
+
+      return { success: true, output: combinedOutput || 'Command executed successfully' };
+    }
+
+    return { success: false, output: `Execution failed: ${lastError}` };
+  }
+
+  private async getUserSettings(): Promise<{
+    webhook: string | null;
+    lang: SupportedLanguage;
+    publicIp: string | null;
+    lanIp: string | null;
+    proxyEnabled: boolean;
+    proxyBaseDomain: string | null;
+  }> {
+    try {
+      const settings = await this.settingsRepo.findOne({
+        where: { discordWebhook: Not(IsNull()) },
+        order: { id: 'ASC' },
+      });
+      // The webhook and language are per user; the rest describes the host and
+      // lives on the instance.
+      const [network, proxy] = await Promise.all([this.instanceSettings.getNetwork(), this.instanceSettings.getProxy()]);
+
+      return {
+        webhook: settings?.discordWebhook || null,
+        lang: (settings?.language as SupportedLanguage) || 'es',
+        publicIp: network.publicIp,
+        lanIp: network.lanIp,
+        proxyEnabled: proxy.enabled,
+        proxyBaseDomain: proxy.baseDomain,
+      };
+    } catch (error) {
+      this.logger.warn('Failed to get user settings', error);
+      return { webhook: null, lang: 'es', publicIp: null, lanIp: null, proxyEnabled: false, proxyBaseDomain: null };
+    }
+  }
+
+  private async getServerPort(serverId: string): Promise<string | undefined> {
+    try {
+      const dockerComposePath = this.getDockerComposePath(serverId);
+      if (await fs.pathExists(dockerComposePath)) {
+        const content = await fs.readFile(dockerComposePath, 'utf8');
+        const config = yaml.load(content) as any;
+        const ports = config?.services?.mc?.ports;
+        if (Array.isArray(ports) && ports.length > 0) {
+          return ports[0].split(':')[0];
+        }
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to get port for server ${serverId}`, error);
+    }
+    return undefined;
+  }
+
+  private async getServerEdition(serverId: string): Promise<ServerEdition> {
+    try {
+      const dockerComposePath = this.getDockerComposePath(serverId);
+      if (await fs.pathExists(dockerComposePath)) {
+        const content = await fs.readFile(dockerComposePath, 'utf8');
+        const config = yaml.load(content) as any;
+        const image = config?.services?.mc?.image ?? '';
+        return image.includes('bedrock') ? 'BEDROCK' : 'JAVA';
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to get edition for server ${serverId}`, error);
+    }
+    return 'JAVA';
+  }
+
+  // Named by what the config points at: the pack's title would cost a CurseForge
+  // call on every event.
+  private describeModpack(config: ServerConfig): string | undefined {
+    const lastSegment = (value?: string) => value?.split('/').pop() || undefined;
+    switch (config.serverType) {
+      case 'AUTO_CURSEFORGE':
+        if (config.cfMethod === 'slug') return config.cfSlug || undefined;
+        if (config.cfMethod === 'file') return config.cfSlug || lastSegment(config.cfModpackZip);
+        return /\/modpacks\/([^/?#]+)/.exec(config.cfUrl ?? '')?.[1];
+      case 'CURSEFORGE':
+        return lastSegment(config.cfServerMod);
+      case 'MODRINTH':
+        return lastSegment(config.modrinthModpack);
+      case 'FTBA':
+        return config.ftbModpackId ? `FTB #${config.ftbModpackId}` : undefined;
+      case 'GTNH':
+        return ['GT New Horizons', config.gtnhPackVersion].filter(Boolean).join(' ');
+      default:
+        return undefined;
+    }
+  }
+
+  private async sendServerNotification(type: ServerEventType, serverName: string, details?: { port?: string; ip?: string; lanIp?: string; players?: string; version?: string; modpack?: string; reason?: string }): Promise<void> {
+    try {
+      const userSettings = await this.getUserSettings();
+
+      const enrichedDetails = { ...details };
+
+      // Get port if not provided
+      if (!enrichedDetails.port) {
+        enrichedDetails.port = await this.getServerPort(serverName);
+      }
+
+      const config = await this.store.readConfig(serverName).catch(() => null);
+      if (config?.minecraftVersion) enrichedDetails.version ??= config.minecraftVersion;
+      const modpack = config && this.describeModpack(config);
+      if (modpack) enrichedDetails.modpack ??= modpack;
+
+      // Get server edition - proxy only works with Java
+      const edition = await this.getServerEdition(serverName);
+      const supportsProxy = edition === 'JAVA';
+
+      // Priority: 1. Proxy hostname (Java only), 2. Settings IP, 3. ENV, 4. undefined
+      if (supportsProxy && userSettings.proxyEnabled && userSettings.proxyBaseDomain) {
+        // When proxy is active, use hostname instead of IP:port
+        const proxyHostname = await this.getServerProxyHostname(serverName, userSettings.proxyBaseDomain);
+        if (proxyHostname) {
+          enrichedDetails.ip = proxyHostname;
+          enrichedDetails.port = undefined; // Don't show port with proxy hostname
+          enrichedDetails.lanIp = undefined; // LAN IP not relevant with proxy
+        }
+      } else {
+        // No proxy or Bedrock - use IP:port from settings
+        if (!enrichedDetails.ip) {
+          enrichedDetails.ip = userSettings.publicIp || undefined;
+        }
+        if (!enrichedDetails.lanIp) {
+          enrichedDetails.lanIp = userSettings.lanIp || undefined;
+        }
+        // A Velocity member publishes no port of its own: players come in through the proxy.
+        if (supportsProxy && (await this.isVelocityMember(serverName))) {
+          enrichedDetails.port = (await this.instanceSettings.getRouterSettings()).proxyPort;
+        }
+      }
+
+      await this.notificationsService.sendServerNotification(userSettings.webhook || '', type, serverName, userSettings.lang, enrichedDetails);
+    } catch (error) {
+      this.logger.error('Server notification error', error);
+    }
+  }
+
+  private async isVelocityMember(serverId: string): Promise<boolean> {
+    const edge = await this.instanceSettings.getComposeEdge();
+    if (edge !== 'velocity') return false;
+    const config = await this.store.readConfig(serverId);
+    return config?.velocityEnabled === true && isVelocityBackend(config);
+  }
+
+  private async getServerProxyHostname(serverId: string, baseDomain: string): Promise<string | null> {
+    try {
+      const dockerComposePath = this.getDockerComposePath(serverId);
+      if (await fs.pathExists(dockerComposePath)) {
+        const content = await fs.readFile(dockerComposePath, 'utf8');
+        const config = yaml.load(content) as any;
+        const labels = config?.services?.mc?.labels;
+
+        if (!getComposeLabelFlag(labels, 'minepanel.proxy.enabled', true)) {
+          return null;
+        }
+
+        const hostname = getComposeLabel(labels, 'minepanel.proxy.hostname');
+        if (hostname) {
+          return hostname;
+        }
+      }
+      // Default: generate hostname from serverId
+      return `${serverId}.${baseDomain}`;
+    } catch (error) {
+      this.logger.warn(`Failed to get proxy hostname for ${serverId}`, error);
+      return `${serverId}.${baseDomain}`;
+    }
+  }
+
+  private findContainerId(serverId: string): Promise<string> {
+    if (!this.validateServerId(serverId)) {
+      return Promise.reject(new Error(`Invalid server ID: ${serverId}`));
+    }
+
+    const cached = this.containerIdCache.get(serverId);
+    if (cached && Date.now() - cached.at < this.CONTAINER_ID_TTL_MS) {
+      return cached.id;
+    }
+
+    const entry = { at: Date.now(), id: this.lookupContainerId(serverId) };
+    this.containerIdCache.set(serverId, entry);
+    // Only a found id is worth keeping: a server with no container yet must see it as
+    // soon as one exists. Concurrent callers still share the in-flight lookup.
+    const drop = () => {
+      if (this.containerIdCache.get(serverId) === entry) this.containerIdCache.delete(serverId);
+    };
+    entry.id.then((id) => !id && drop(), drop);
+    return entry.id;
+  }
+
+  private async lookupContainerId(serverId: string): Promise<string> {
+
+    const dockerComposePath = this.getDockerComposePath(serverId);
+    if (await fs.pathExists(dockerComposePath)) {
+      try {
+        const { stdout } = await this.execComposeCommand(serverId, DOCKER_COMMANDS.COMPOSE_PS_SERVICE);
+        const composeContainerIds = stdout
+          .toString()
+          .trim()
+          .split('\n')
+          .filter((id) => id.trim());
+
+        if (composeContainerIds.length > 0) {
+          if (composeContainerIds.length > 1) {
+            this.logger.warn(`Multiple compose containers found for server "${serverId}". Using first: ${composeContainerIds[0]}`);
+          }
+          return composeContainerIds[0];
+        }
+      } catch (error) {
+        this.logger.warn(`Could not resolve compose container for server ${serverId}, using legacy fallback`, error);
+      }
+    }
+
+    if (exclusiveJavaEnabled()) return '';
+    const { stdout } = await execRead(DOCKER_COMMANDS.PS_FILTER(serverId));
+    if (stdout.trim()) {
+      const containerIds = stdout
+        .trim()
+        .split('\n')
+        .filter((id) => id.trim());
+      if (containerIds.length > 1) {
+        this.logger.warn(`Multiple exact matches found for server "${serverId}". Using first: ${containerIds[0]}. ` + `Found: ${containerIds.join(', ')}`);
+      }
+      return containerIds[0];
+    }
+
+    this.logger.debug(`No container found with exact name matching "${serverId}"`);
+    return '';
+  }
+
+  // Every mount in a server's compose file is a host path under SERVERS_HOST_DIR. With a
+  // guessed one the daemon would create an empty bind source and the server would write a
+  // fresh world into it, which is worse than not starting at all.
+  private hostDirIsKnown(serverId: string): boolean {
+    if (!this.SERVERS_HOST_DIR_IS_A_GUESS) return true;
+
+    this.logger.error(
+      `Refusing to start server ${serverId}: the host path of /app/servers is unknown, so "${path.join(this.SERVERS_HOST_DIR, serverId)}" is a guess and the server would run against an empty directory. ` +
+        'See the [config] warnings at startup and restart the panel.',
+    );
+    return false;
+  }
+
+  async restartServer(serverId: string, notifyFailure = true): Promise<boolean> {
+    if (!exclusiveJavaEnabled()) return this.restartRegularServer(serverId, notifyFailure);
+    assertExclusiveProfile(serverId);
+    return this.exclusiveOperation.run(async () => {
+      const slot = await this.getExclusiveSlot();
+      if (slot && slot.profile !== serverId) throw this.exclusiveOccupied(slot.profile);
+      if (slot?.status === 'running') await this.stopExclusiveSlot(slot);
+      return this.startExclusiveProfile(serverId);
+    });
+  }
+
+  private async restartRegularServer(serverId: string, notifyFailure: boolean): Promise<boolean> {
+    try {
+      if (!this.validateServerId(serverId)) {
+        this.logger.error(`Invalid server ID: ${serverId}`);
+        return false;
+      }
+
+      const dockerComposePath = this.getDockerComposePath(serverId);
+      if (!(await fs.pathExists(dockerComposePath))) {
+        this.logger.error(`Docker compose file does not exist for server ${serverId}`);
+        return false;
+      }
+
+      if (!this.hostDirIsKnown(serverId)) {
+        return false;
+      }
+
+      // The compose file is derived from server.json, so refresh it here instead
+      // of trusting whatever was written the last time someone pressed save. This
+      // covers every way a server runs: the UI, the scheduler, and the mc-router
+      // wake-up webhook.
+      await this.refreshComposeFile(serverId);
+
+      this.alertsService.markExpectedStop(serverId);
+      await this.execPlannedComposeDown(serverId);
+      await this.execComposeCommand(serverId, DOCKER_COMMANDS.COMPOSE_UP);
+
+      this.logger.log(`Server ${serverId} restarted successfully`);
+      void this.notifyWhenReady(serverId, 'restarted');
+
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to restart server ${serverId}`, error);
+      if (notifyFailure) void this.sendServerNotification('error', serverId, { reason: 'Failed to restart server' });
+      return false;
+    }
+  }
+
+  async clearServerData(serverId: string): Promise<boolean> {
+    if (exclusiveJavaEnabled()) throw new ConflictException('This action is disabled in exclusive Java mode');
+    try {
+      if (!this.validateServerId(serverId)) {
+        this.logger.error(`Invalid server ID: ${serverId}`);
+        return false;
+      }
+
+      const serverDataDir = this.getMcDataPath(serverId);
+      const dockerComposePath = this.getDockerComposePath(serverId);
+
+      if (await fs.pathExists(dockerComposePath)) {
+        this.alertsService.markExpectedStop(serverId);
+        this.cancelReadyWatch(serverId);
+        await this.execPlannedComposeDown(serverId);
+      }
+
+      if (await fs.pathExists(serverDataDir)) {
+        await fs.remove(serverDataDir);
+        await fs.ensureDir(serverDataDir);
+        this.logger.log(`Server data cleared for ${serverId}`);
+        return true;
+      }
+
+      this.logger.warn(`Server data directory not found for ${serverId}`);
+      return false;
+    } catch (error) {
+      this.logger.error(`Failed to clear data for server "${serverId}"`, error);
+      return false;
+    }
+  }
+
+  // Read by the crash alert once a server has stopped; null when there is no container to inspect.
+  async getCrashInfo(serverId: string): Promise<{ exitCode: number; logTail: string } | null> {
+    try {
+      const containerId = await this.findContainerId(serverId);
+      if (!containerId) {
+        return null;
+      }
+      const { stdout: exitCode } = await execRead(DOCKER_COMMANDS.INSPECT_EXIT_CODE(containerId));
+      const { stdout: logTail } = await execRead(DOCKER_COMMANDS.LOGS(containerId, 20));
+      return { exitCode: Number.parseInt(exitCode.trim(), 10), logTail };
+    } catch (error) {
+      this.logger.warn(`Failed to read crash info for ${serverId}: ${(error as Error).message}`);
+      return null;
+    }
+  }
+
+  // `retry`: a cached id may belong to a container removed outside the panel, so a failed
+  // inspect looks the container up again once before reporting.
+  async getServerStatus(serverId: string, retry = true): Promise<ServerStatus> {
+    try {
+      if (!this.validateServerId(serverId)) {
+        this.logger.error(`Invalid server ID: ${serverId}`);
+        return 'not_found';
+      }
+
+      if (!(await this.serverExists(serverId))) {
+        return 'not_found';
+      }
+
+      const containerId = await this.findContainerId(serverId);
+
+      if (containerId) {
+        const inspected = await execRead(DOCKER_COMMANDS.INSPECT_STATUS(containerId)).catch((error) => {
+          this.containerIdCache.delete(serverId);
+          if (!retry) throw error;
+          return null;
+        });
+        return inspected ? this.toServerStatus(inspected.stdout) : this.getServerStatus(serverId, false);
+      }
+
+      if (await fs.pathExists(this.getDockerComposePath(serverId))) {
+        return 'stopped';
+      }
+
+      return 'not_found';
+    } catch (error) {
+      this.logger.error(`Failed to get status for server ${serverId}`, error);
+      return 'not_found';
+    }
+  }
+
+  private toServerStatus(state: string): ServerStatus {
+    const status = state.trim().toLowerCase();
+    if (status.includes('restarting') || status.includes('created')) return 'starting';
+    if (status.includes('running')) return 'running';
+    return 'stopped';
+  }
+
+  // getServerStatus for many servers with a single `docker inspect`, so a fleet poll costs
+  // one inspect instead of one per server.
+  private async getServerStatuses(serverIds: string[]): Promise<Map<string, { status: ServerStatus; containerId: string }>> {
+    const lookups = await Promise.all(
+      serverIds.map(async (serverId) => {
+        if (!this.validateServerId(serverId) || !(await this.serverExists(serverId))) {
+          return { serverId, containerId: '', exists: false };
+        }
+        const containerId = await this.findContainerId(serverId).catch((error) => {
+          this.logger.error(`Failed to get status for server ${serverId}`, error);
+          return null;
+        });
+        return { serverId, containerId, exists: containerId !== null };
+      }),
+    );
+
+    const ids = lookups.map(({ containerId }) => containerId).filter((id): id is string => !!id);
+    const states = new Map<string, string>();
+    if (ids.length > 0) {
+      // Exits non-zero when one id is gone, but still prints the others.
+      const { stdout } = await execRead(DOCKER_COMMANDS.INSPECT_STATUSES(ids)).catch((error: { stdout?: string }) => ({ stdout: error.stdout ?? '' }));
+      for (const line of stdout.trim().split('\n')) {
+        const [fullId, state] = line.trim().split(' ');
+        const id = fullId && ids.find((candidate) => fullId.startsWith(candidate));
+        if (id && state) states.set(id, state);
+      }
+    }
+
+    const result = new Map<string, { status: ServerStatus; containerId: string }>();
+    for (const { serverId, containerId, exists } of lookups) {
+      if (!exists) {
+        result.set(serverId, { status: 'not_found', containerId: '' });
+      } else if (containerId && states.has(containerId)) {
+        result.set(serverId, { status: this.toServerStatus(states.get(containerId)), containerId });
+      } else if (containerId) {
+        // A cached id whose container was removed outside the panel: look it up again.
+        this.containerIdCache.delete(serverId);
+        const status = await this.getServerStatus(serverId);
+        result.set(serverId, { status, containerId: status === 'not_found' ? '' : await this.findContainerId(serverId).catch(() => '') });
+      } else {
+        result.set(serverId, { status: (await fs.pathExists(this.getDockerComposePath(serverId))) ? 'stopped' : 'not_found', containerId: '' });
+      }
+    }
+    return result;
+  }
+
+  async getAllServersStatus(): Promise<Record<string, ServerStatus>> {
+    try {
+      const directories = await fs.readdir(this.SERVERS_DIR);
+      const serverDirectories = await Promise.all(
+        directories.map(async (dir) => {
+          if (this.RESERVED_SERVER_DIRS.has(dir) || dir.startsWith('.')) {
+            return null;
+          }
+          const fullPath = path.join(this.SERVERS_DIR, dir);
+          const isDirectory = (await fs.stat(fullPath)).isDirectory();
+          const hasDockerCompose = await fs.pathExists(this.getDockerComposePath(dir));
+          return isDirectory && hasDockerCompose ? dir : null;
+        }),
+      );
+
+      const validServers = serverDirectories.filter((dir): dir is string => dir !== null);
+      const statuses = await this.getServerStatuses(validServers);
+      return Object.fromEntries([...statuses].map(([serverId, { status }]) => [serverId, status]));
+    } catch (error) {
+      this.logger.error('Error obtaining all servers status', error);
+      return {};
+    }
+  }
+
+  async getServerInfo(serverId: string): Promise<ServerInfo> {
+    try {
+      if (!this.validateServerId(serverId)) {
+        this.logger.error(`Invalid server ID: ${serverId}`);
+        return {
+          exists: false,
+          status: 'not_found',
+          error: 'Invalid server ID',
+        };
+      }
+
+      const status = await this.getServerStatus(serverId);
+      if (status === 'not_found') {
+        return {
+          exists: false,
+          status,
+        };
+      }
+
+      const dockerComposePath = this.getDockerComposePath(serverId);
+      const mcDataPath = this.getMcDataPath(serverId);
+
+      const dockerComposeExists = await fs.pathExists(dockerComposePath);
+      const mcDataExists = await fs.pathExists(mcDataPath);
+
+      let worldSize = 0;
+      let lastUpdated: Date | null = null;
+
+      if (mcDataExists) {
+        const worldPath = path.join(mcDataPath, 'world');
+        if (await fs.pathExists(worldPath)) {
+          const { stdout } = await execAsync(DOCKER_COMMANDS.DU_SIZE(worldPath));
+          worldSize = Number.parseInt(stdout.trim(), 10);
+          const stats = await fs.stat(worldPath);
+          lastUpdated = stats.mtime;
+        }
+      }
+
+      return {
+        exists: true,
+        status,
+        dockerComposeExists,
+        mcDataExists,
+        worldSize,
+        lastUpdated,
+        worldSizeFormatted: this.formatBytes(worldSize),
+      };
+    } catch (error) {
+      this.logger.error(`Failed to get info for server ${serverId}`, error);
+      return {
+        exists: false,
+        status: 'not_found',
+        error: (error as Error).message,
+      };
+    }
+  }
+
+  private async refreshComposeFile(serverId: string): Promise<void> {
+    const edge = await this.instanceSettings.getComposeEdge();
+    await this.composeService.refreshComposeFile(serverId, edge);
+    // Before `up`: Paper reads the forwarding secret once, on boot.
+    const config = await this.store.readConfig(serverId);
+    if (config) await this.velocityForwarding.apply(config, edge);
+  }
+
+  async deleteServer(serverId: string): Promise<boolean> {
+    if (exclusiveJavaEnabled()) throw new ConflictException('This action is disabled in exclusive Java mode');
+    const releases: Array<() => void> = [];
+    let ownsDeletion = false;
+    try {
+      if (!this.validateServerId(serverId)) {
+        this.logger.error(`Invalid server ID: ${serverId}`);
+        return false;
+      }
+
+      if (this.deletingServers.has(serverId)) return false;
+      this.deletingServers.add(serverId);
+      ownsDeletion = true;
+
+      const serverDir = path.join(this.SERVERS_DIR, serverId);
+      const dockerComposePath = this.getDockerComposePath(serverId);
+
+      if (!(await fs.pathExists(serverDir))) {
+        this.logger.error(`Server directory does not exist for server ${serverId}`);
+        return false;
+      }
+
+      if (await fs.pathExists(dockerComposePath)) {
+        try {
+          this.alertsService.markExpectedStop(serverId);
+          this.cancelReadyWatch(serverId);
+          await this.execPlannedComposeDown(serverId);
+        } catch (error) {
+          this.logger.warn(`Could not stop server ${serverId} before deletion`, error);
+        }
+      }
+
+      for (const guard of this.deletionGuards) releases.push(await guard(serverId));
+
+      // Server IDs are reusable: a new server with this ID must not inherit its player
+      // history, its scheduled tasks or the users that were granted access to it.
+      // Keep server.json/compose in place until cleanup commits: createServer treats the ID as taken.
+      await this.settingsRepo.manager.transaction(async (manager) => {
+        await manager.delete(PlayerSession, { serverId });
+        await manager.delete(PlayerTracking, { serverId });
+        await manager.delete(ScheduledTask, { serverId });
+        await manager.delete(MetricSample, { serverId });
+        await manager.delete(UptimeInterval, { serverId });
+        await manager.delete(LogPreset, { serverId });
+        for (const entity of [Users, UserInvitation]) {
+          const grantees = (await manager.find(entity)).filter((row) => row.serverAccess?.includes(serverId));
+          for (const row of grantees) row.serverAccess = row.serverAccess.filter((id) => id !== serverId);
+          if (grantees.length) await manager.save(grantees);
+        }
+      });
+
+      try {
+        const { stdout: volumeList } = await execAsync(DOCKER_COMMANDS.VOLUME_LIST(this.getComposeProjectName(serverId) ?? serverId.toLowerCase()));
+        if (volumeList.trim()) {
+          const volumes = volumeList.trim().split('\n');
+          for (const volume of volumes) {
+            await execAsync(DOCKER_COMMANDS.VOLUME_REMOVE(volume));
+          }
+        }
+      } catch (error) {
+        this.logger.warn(`Could not clean up docker volumes for ${serverId}`, error);
+      }
+
+      await fs.remove(serverDir);
+      this.alertsService.clearState(serverId);
+      await this.store.removeFromIndex(serverId);
+
+      this.logger.log(`Server ${serverId} deleted successfully`);
+      void this.sendServerNotification('deleted', serverId);
+
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to delete server ${serverId}`, error);
+      void this.sendServerNotification('error', serverId, { reason: 'Failed to delete server' });
+      return false;
+    } finally {
+      for (const release of releases.reverse()) release();
+      if (ownsDeletion) this.deletingServers.delete(serverId);
+    }
+  }
+
+  async getServerResources(serverId: string): Promise<{
+    cpuUsage: string;
+    memoryUsage: string;
+    memoryLimit: string;
+  }> {
+    try {
+      if (!this.validateServerId(serverId)) {
+        throw new Error(`Invalid server ID: ${serverId}`);
+      }
+
+      const containerId = await this.findContainerId(serverId);
+      if (!containerId) throw new Error('Container not found or not running');
+
+      const { stdout } = await execRead(DOCKER_COMMANDS.STATS_ONE(containerId));
+      const [cpuStats = '', memStats = ''] = stdout.trim().split('\t');
+
+      const memoryParts = memStats.trim().split(' / ');
+      return {
+        cpuUsage: cpuStats.trim(),
+        memoryUsage: memoryParts[0],
+        memoryLimit: memoryParts[1] || 'N/A',
+      };
+    } catch (error) {
+      this.logger.error(`Failed to get resource usage for server ${serverId}`, error);
+      return {
+        cpuUsage: 'N/A',
+        memoryUsage: 'N/A',
+        memoryLimit: 'N/A',
+      };
+    }
+  }
+
+  // Same defaults the stats UI assumed when the compose file had no limits (Bedrock never has).
+  private async getServerLimits(serverId: string): Promise<{ cpuLimit: string; memoryLimit: string }> {
+    try {
+      const config = await this.store.readConfig(serverId);
+      if (!config || config.edition === 'BEDROCK') {
+        return { cpuLimit: '1', memoryLimit: '4G' };
+      }
+      return { cpuLimit: config.cpuLimit || '1', memoryLimit: containerMemoryLimit(config.maxMemory || '4G') };
+    } catch (error) {
+      this.logger.warn(`Failed to read limits for ${serverId}:`, error);
+      return { cpuLimit: '1', memoryLimit: '4G' };
+    }
+  }
+
+
+  async getAllServersResources(): Promise<Record<string, ServerResourceInfo>> {
+    const results = await this.collectServersResources();
+    return results.reduce(
+      (acc, { serverId, data }) => {
+        acc[serverId] = data;
+        return acc;
+      },
+      {} as Record<string, ServerResourceInfo>,
+    );
+  }
+
+  // Resolves status, limits, container id and live stats for every server in one pass.
+  // Both the resources endpoint and the runtime stats endpoint build on this, so the
+  // docker calls behind it are not paid twice.
+  private async collectServersResources(): Promise<Array<{ serverId: string; containerId: string; data: ServerResourceInfo }>> {
+    try {
+      const directories = await fs.readdir(this.SERVERS_DIR);
+      const serverDirectories = await Promise.all(
+        directories.map(async (dir) => {
+          if (this.RESERVED_SERVER_DIRS.has(dir) || dir.startsWith('.')) {
+            return null;
+          }
+          const fullPath = path.join(this.SERVERS_DIR, dir);
+          const isDirectory = (await fs.stat(fullPath)).isDirectory();
+          const hasDockerCompose = await fs.pathExists(this.getDockerComposePath(dir));
+          return isDirectory && hasDockerCompose ? dir : null;
+        }),
+      );
+
+      const validServers = serverDirectories.filter((dir): dir is string => dir !== null);
+
+      // Get all stats in ONE docker command (much faster than individual calls)
+      const [allStats, statuses] = await Promise.all([this.getAllContainersStats(), this.getServerStatuses(validServers)]);
+
+      const serverDataPromises = validServers.map(async (serverId) => {
+        const limits = await this.getServerLimits(serverId);
+        const { status, containerId } = statuses.get(serverId);
+
+        // Prefer exact container ID mapping, then fallback to legacy name patterns
+        const stats = allStats.byId[containerId] || allStats.byName[serverId] || allStats.byName[`${serverId}-minecraft-1`] || allStats.byName[`${serverId}_minecraft_1`];
+
+        if (status !== 'running' || !stats) {
+          return {
+            serverId,
+            containerId,
+            data: {
+              status,
+              cpuUsage: 'N/A',
+              memoryUsage: 'N/A',
+              memoryLimit: 'N/A',
+              cpuLimit: limits.cpuLimit,
+              memoryConfigLimit: limits.memoryLimit,
+            },
+          };
+        }
+
+        return {
+          serverId,
+          containerId,
+          data: {
+            status,
+            cpuUsage: stats.cpuUsage,
+            memoryUsage: stats.memoryUsage,
+            memoryLimit: stats.memoryLimit,
+            cpuLimit: limits.cpuLimit,
+            memoryConfigLimit: limits.memoryLimit,
+          },
+        };
+      });
+
+      return await Promise.all(serverDataPromises);
+    } catch (error) {
+      this.logger.error('Error obtaining all servers resources', error);
+      return [];
+    }
+  }
+
+  // Get stats for ALL running containers in a single docker command
+  private async getAllContainersStats(): Promise<{
+    byId: Record<string, { cpuUsage: string; memoryUsage: string; memoryLimit: string }>;
+    byName: Record<string, { cpuUsage: string; memoryUsage: string; memoryLimit: string }>;
+  }> {
+    try {
+      const { stdout } = await execRead(DOCKER_COMMANDS.STATS_ALL);
+      const statsById: Record<string, { cpuUsage: string; memoryUsage: string; memoryLimit: string }> = {};
+      const statsByName: Record<string, { cpuUsage: string; memoryUsage: string; memoryLimit: string }> = {};
+
+      const lines = stdout
+        .trim()
+        .split('\n')
+        .filter((line) => line.trim());
+      for (const line of lines) {
+        const parts = line.split('\t');
+        if (parts.length >= 4) {
+          const containerId = parts[0].trim();
+          const name = parts[1].trim();
+          const cpuUsage = parts[2].trim();
+          const memUsage = parts[3].trim();
+          const memoryParts = memUsage.split(' / ');
+
+          const parsedStats = {
+            cpuUsage,
+            memoryUsage: memoryParts[0] || 'N/A',
+            memoryLimit: memoryParts[1] || 'N/A',
+          };
+          statsById[containerId] = parsedStats;
+          statsByName[name] = parsedStats;
+        }
+      }
+
+      return { byId: statsById, byName: statsByName };
+    } catch (error) {
+      this.logger.warn('Failed to get all containers stats:', error);
+      return { byId: {}, byName: {} };
+    }
+  }
+
+  private async probeMinecraftStatus(serverId: string, containerId: string, edition: ServerEdition): Promise<GameProbeResult> {
+    const cached = this.statusProbeCache.get(serverId);
+    if (cached && Date.now() - cached.at < this.STATUS_PROBE_TTL_MS) {
+      return cached.value;
+    }
+
+    const inFlight = this.statusProbeInFlight.get(serverId);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const probe = this.runMinecraftStatusProbe(containerId, edition)
+      .then((value) => {
+        this.statusProbeCache.set(serverId, { at: Date.now(), value });
+        return value;
+      })
+      .finally(() => {
+        this.statusProbeInFlight.delete(serverId);
+      });
+
+    this.statusProbeInFlight.set(serverId, probe);
+    return probe;
+  }
+
+  // mc-monitor ships inside the itzg images (it backs their healthcheck), so the probe
+  // works for Java and Bedrock without RCON credentials.
+  private async runMinecraftStatusProbe(containerId: string, edition: ServerEdition): Promise<GameProbeResult> {
+    const isBedrock = edition === 'BEDROCK';
+    const args = [
+      'exec',
+      containerId,
+      'mc-monitor',
+      isBedrock ? 'status-bedrock' : 'status',
+      '--host',
+      '127.0.0.1',
+      '--port',
+      isBedrock ? '19132' : '25565',
+      '--timeout',
+      '3s',
+    ];
+
+    try {
+      const { stdout, stderr, exitCode } = await this.executeProcess('docker', args, { timeout: 5_000 });
+      if (exitCode !== 0) {
+        const diagnostic = `${stderr} ${stdout}`;
+        const infrastructure = /docker daemon|error response from daemon|OCI runtime|exec failed|permission denied|executable file not found|no such container/i.test(diagnostic);
+        const failedQuery = /failed to ping 127\.0\.0\.1:25565|server not ready 127\.0\.0\.1:25565|failed to ping Bedrock server|failed to query bedrock server 127\.0\.0\.1:19132/i.test(diagnostic);
+        return { value: null, status: !infrastructure && failedQuery ? 'failed' : 'unknown' };
+      }
+      const value = parseMinecraftStatus(this.sanitizeCommandOutput(stdout));
+      return { value, status: value ? 'healthy' : 'unknown' };
+    } catch (error) {
+      this.logger.debug(`Minecraft status probe failed for container ${containerId}: ${(error as Error).message}`);
+      return { value: null, status: 'unknown' };
+    }
+  }
+
+  // Bumping the generation makes any readiness watch still running for this server give up.
+  private cancelReadyWatch(serverId: string): number {
+    const generation = (this.readyWatches.get(serverId) ?? 0) + 1;
+    this.readyWatches.set(serverId, generation);
+    return generation;
+  }
+
+  // compose up returns as soon as the container runs, minutes before Minecraft accepts
+  // players, so "started" waits for the status probe instead. A container that stops
+  // meanwhile is left to the crash/down alerts.
+  private async notifyWhenReady(serverId: string, type: 'started' | 'restarted'): Promise<void> {
+    const generation = this.cancelReadyWatch(serverId);
+    const deadline = Date.now() + this.READY_TIMEOUT_MS;
+    const isCurrent = () => this.readyWatches.get(serverId) === generation;
+    const edition = await this.getServerEdition(serverId);
+
+    while (isCurrent()) {
+      const status = await this.getServerStatus(serverId);
+      if (status === 'stopped' || status === 'not_found') return;
+
+      const containerId = status === 'running' ? await this.findContainerId(serverId).catch(() => '') : '';
+      const ready = containerId !== '' && (await this.runMinecraftStatusProbe(containerId, edition)).status === 'healthy';
+      if (!isCurrent()) return;
+
+      if (ready) {
+        await this.sendServerNotification(type, serverId);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        await this.sendServerNotification('warning', serverId, { reason: `Server started but not reachable after ${this.READY_TIMEOUT_MS / 60_000} minutes` });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, this.READY_POLL_INTERVAL_MS));
+    }
+  }
+
+  // One docker inspect for every container, not one per server.
+  private async getContainersStartedAt(containerIds: string[]): Promise<Record<string, number>> {
+    const ids = containerIds.filter((id) => id);
+    if (ids.length === 0) {
+      return {};
+    }
+
+    try {
+      const { stdout, exitCode } = await this.executeProcess('docker', ['inspect', '--format={{.Id}} {{.State.StartedAt}}', ...ids], { timeout: 5_000 });
+      if (exitCode !== 0) {
+        return {};
+      }
+
+      const startedAt: Record<string, number> = {};
+      for (const line of stdout.trim().split('\n')) {
+        const [fullId, rawStartedAt] = line.trim().split(' ');
+        if (!fullId || !rawStartedAt) continue;
+
+        const parsed = Date.parse(rawStartedAt);
+        if (!Number.isFinite(parsed) || parsed <= 0 || parsed > Date.now()) continue;
+
+        // Callers hold short ids, docker inspect answers with the full one.
+        const matchedId = ids.find((id) => fullId.startsWith(id));
+        if (matchedId) {
+          startedAt[matchedId] = parsed;
+        }
+      }
+      return startedAt;
+    } catch (error) {
+      this.logger.debug(`Could not read container start times: ${(error as Error).message}`);
+      return {};
+    }
+  }
+
+  private toUptimeSeconds(startedAt: number | undefined): number | null {
+    return startedAt ? Math.floor((Date.now() - startedAt) / 1_000) : null;
+  }
+
+  private async getRuntimeProbeConfig(serverId: string): Promise<{ edition: ServerEdition; playersMax: number | null }> {
+    try {
+      const config = await this.store.readConfig(serverId);
+      const maxPlayers = Number.parseInt(config?.maxPlayers ?? '', 10);
+      return {
+        edition: config?.edition === 'BEDROCK' ? 'BEDROCK' : 'JAVA',
+        playersMax: Number.isFinite(maxPlayers) && maxPlayers >= 0 ? maxPlayers : null,
+      };
+    } catch (error) {
+      this.logger.debug(`Could not read runtime config for ${serverId}: ${(error as Error).message}`);
+      return { edition: 'JAVA', playersMax: null };
+    }
+  }
+
+  // A running container is not a reachable game: keep game values null so the UI never
+  // turns a failed probe into "0 players online".
+  private withoutGameStats(resource: ServerResourceInfo): ServerRuntimeStats {
+    return {
+      ...resource,
+      playersOnline: null,
+      playersMax: null,
+      uptimeSeconds: null,
+      version: null,
+      gameReachable: false,
+      gameQueryStatus: 'unknown',
+    };
+  }
+
+  private buildRuntimeStats(resource: ServerResourceInfo, result: GameProbeResult, playersMaxFallback: number | null, uptimeSeconds: number | null): ServerRuntimeStats {
+    const probe = result.value;
+    return {
+      ...resource,
+      playersOnline: probe?.playersOnline ?? null,
+      playersMax: probe?.playersMax ?? playersMaxFallback,
+      uptimeSeconds,
+      version: probe?.version ?? null,
+      gameReachable: probe !== null,
+      gameQueryStatus: result.status,
+    };
+  }
+
+  async getServerRuntimeStats(serverId: string): Promise<ServerRuntimeStats> {
+    const unavailable: ServerResourceInfo = {
+      status: 'not_found',
+      cpuUsage: 'N/A',
+      memoryUsage: 'N/A',
+      memoryLimit: 'N/A',
+      cpuLimit: '1',
+      memoryConfigLimit: '4G',
+    };
+
+    if (!this.validateServerId(serverId)) {
+      return this.withoutGameStats(unavailable);
+    }
+
+    try {
+      const [status, limits, containerId, probeConfig] = await Promise.all([this.getServerStatus(serverId), this.getServerLimits(serverId), this.findContainerId(serverId), this.getRuntimeProbeConfig(serverId)]);
+
+      const base: ServerResourceInfo = {
+        ...unavailable,
+        status,
+        cpuLimit: limits.cpuLimit,
+        memoryConfigLimit: limits.memoryLimit,
+      };
+
+      if (status !== 'running' || !containerId) {
+        return this.withoutGameStats(base);
+      }
+
+      const [resources, probe, startedAt] = await Promise.all([this.getServerResources(serverId), this.probeMinecraftStatus(serverId, containerId, probeConfig.edition), this.getContainersStartedAt([containerId])]);
+
+      return this.buildRuntimeStats({ ...base, ...resources }, probe, probeConfig.playersMax, this.toUptimeSeconds(startedAt[containerId]));
+    } catch (error) {
+      this.logger.warn(`Failed to get runtime stats for ${serverId}: ${(error as Error).message}`);
+      return this.withoutGameStats(unavailable);
+    }
+  }
+
+  async getAllServersRuntimeStats(): Promise<Record<string, ServerRuntimeStats>> {
+    const servers = await this.collectServersResources();
+    const running = servers.filter(({ containerId, data }) => data.status === 'running' && containerId);
+    const startedAt = await this.getContainersStartedAt(running.map(({ containerId }) => containerId));
+
+    const entries = await Promise.all(
+      servers.map(async ({ serverId, containerId, data }) => {
+        if (data.status !== 'running' || !containerId) {
+          return [serverId, this.withoutGameStats(data)] as const;
+        }
+
+        try {
+          const probeConfig = await this.getRuntimeProbeConfig(serverId);
+          const probe = await this.probeMinecraftStatus(serverId, containerId, probeConfig.edition);
+          return [serverId, this.buildRuntimeStats(data, probe, probeConfig.playersMax, this.toUptimeSeconds(startedAt[containerId]))] as const;
+        } catch (error) {
+          this.logger.warn(`Failed to get runtime stats for ${serverId}: ${(error as Error).message}`);
+          return [serverId, this.withoutGameStats(data)] as const;
+        }
+      }),
+    );
+
+    return Object.fromEntries(entries);
+  }
+
+  private formatBytes(bytes: number, decimals = 2): string {
+    if (bytes === 0) return '0 Bytes';
+
+    const k = 1024;
+    const dm = Math.max(0, decimals);
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+
+    return Number.parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+  }
+
+  async getServerLogs(serverId: string, lines: number = 100): Promise<ServerLogsResponse> {
+    try {
+      if (!this.validateServerId(serverId)) {
+        return {
+          logs: 'Invalid server ID',
+          hasErrors: true,
+          lastUpdate: new Date(),
+          status: 'not_found',
+        };
+      }
+
+      if (!(await this.serverExists(serverId))) {
+        return {
+          logs: 'Server not found',
+          hasErrors: false,
+          lastUpdate: new Date(),
+          status: 'not_found',
+        };
+      }
+
+      const containerId = await this.findContainerId(serverId);
+      const serverStatus = await this.getServerStatus(serverId);
+
+      if (!containerId) {
+        return {
+          logs: 'Container not found',
+          hasErrors: false,
+          lastUpdate: new Date(),
+          status: serverStatus,
+        };
+      }
+
+      const { stdout: logs } = await execRead(DOCKER_COMMANDS.LOGS(containerId, lines));
+      const logAnalysis = this.analyzeLogs(logs);
+
+      return {
+        logs,
+        hasErrors: logAnalysis.hasErrors,
+        lastUpdate: new Date(),
+        status: serverStatus,
+        metadata: {
+          totalLines: logAnalysis.totalLines,
+          errorCount: logAnalysis.errorCount,
+          warningCount: logAnalysis.warningCount,
+        },
+      };
+    } catch (error) {
+      this.logger.error(`Failed to get logs for server ${serverId}`, error);
+      return {
+        logs: `Error retrieving logs: ${(error as Error).message}`,
+        hasErrors: true,
+        lastUpdate: new Date(),
+        status: 'not_found',
+      };
+    }
+  }
+
+  private analyzeLogs(logs: string): {
+    hasErrors: boolean;
+    totalLines: number;
+    errorCount: number;
+    warningCount: number;
+  } {
+    if (!logs) {
+      return { hasErrors: false, totalLines: 0, errorCount: 0, warningCount: 0 };
+    }
+
+    const lines = logs.split('\n').filter((line) => line.trim());
+    const errorPatterns = [/ERROR/gi, /SEVERE/gi, /FATAL/gi, /Exception/gi, /java\.lang\./gi, /Caused by:/gi, /\[STDERR\]/gi, /Failed to/gi, /Cannot/gi, /Unable to/gi, /\[Server thread\/ERROR\]/gi, /IllegalArgumentException/gi, /NullPointerException/gi, /OutOfMemoryError/gi, /StackOverflowError/gi, /Connection refused/gi, /Timeout/gi, /Permission denied/gi];
+    const warningPatterns = [/WARN/gi, /WARNING/gi, /\[Server thread\/WARN\]/gi, /deprecated/gi, /outdated/gi, /could not/gi, /missing/gi, /slow/gi, /lag/gi];
+
+    let errorCount = 0;
+    let warningCount = 0;
+
+    for (const line of lines) {
+      if (errorPatterns.some((pattern) => pattern.test(line))) {
+        errorCount++;
+      } else if (warningPatterns.some((pattern) => pattern.test(line))) {
+        warningCount++;
+      }
+    }
+
+    return {
+      hasErrors: errorCount > 0,
+      totalLines: lines.length,
+      errorCount,
+      warningCount,
+    };
+  }
+
+  async getServerLogsStream(
+    serverId: string,
+    lines: number = 100,
+    since?: string,
+  ): Promise<{
+    logs: string;
+    hasErrors: boolean;
+    lastUpdate: Date;
+    status: 'running' | 'stopped' | 'starting' | 'not_found';
+    lastTimestamp?: string;
+    metadata?: {
+      totalLines: number;
+      errorCount: number;
+      warningCount: number;
+    };
+  }> {
+    try {
+      if (!(await fs.pathExists(path.join(this.SERVERS_DIR, serverId)))) {
+        return {
+          logs: 'Server not found',
+          hasErrors: false,
+          lastUpdate: new Date(),
+          status: 'not_found',
+        };
+      }
+
+      const containerId = await this.findContainerId(serverId);
+      const serverStatus = await this.getServerStatus(serverId);
+
+      if (!containerId) {
+        return {
+          logs: 'Container not found',
+          hasErrors: false,
+          lastUpdate: new Date(),
+          status: serverStatus,
+        };
+      }
+
+      let logs: string;
+      if (since) {
+        const { stdout, stderr } = await this.executeProcess('docker', ['logs', '--since', since, '--timestamps', containerId]);
+        logs = stdout + stderr;
+      } else {
+        const { stdout, stderr } = await this.executeProcess('docker', ['logs', '--tail', String(lines), '--timestamps', containerId]);
+        logs = stdout + stderr;
+      }
+      const logAnalysis = this.analyzeLogs(logs);
+
+      let lastTimestamp: string | undefined;
+      if (logs) {
+        const lines = logs.split('\n').filter((line) => line.trim());
+        if (lines.length > 0) {
+          const lastLine = lines[lines.length - 1];
+          const timestampMatch = RegExp(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)/).exec(lastLine);
+          if (timestampMatch) {
+            const timestamp = new Date(timestampMatch[1]);
+            timestamp.setMilliseconds(timestamp.getMilliseconds() + 1);
+            lastTimestamp = timestamp.toISOString();
+          }
+        }
+      }
+
+      return {
+        logs,
+        hasErrors: logAnalysis.hasErrors,
+        lastUpdate: new Date(),
+        status: serverStatus,
+        lastTimestamp,
+        metadata: {
+          totalLines: logAnalysis.totalLines,
+          errorCount: logAnalysis.errorCount,
+          warningCount: logAnalysis.warningCount,
+        },
+      };
+    } catch (error) {
+      console.error(`Failed to get logs stream for server ${serverId}:`, error);
+      return {
+        logs: `Error retrieving logs: ${(error as Error).message}`,
+        hasErrors: true,
+        lastUpdate: new Date(),
+        status: 'not_found',
+      };
+    }
+  }
+
+  async getServerLogsSince(serverId: string, timestamp: string): Promise<ServerLogsResponse> {
+    try {
+      if (!this.validateServerId(serverId)) {
+        return {
+          logs: 'Invalid server ID',
+          hasErrors: true,
+          lastUpdate: new Date(),
+          status: 'not_found',
+          hasNewContent: false,
+        };
+      }
+
+      if (!(await this.serverExists(serverId))) {
+        return {
+          logs: 'Server not found',
+          hasErrors: false,
+          lastUpdate: new Date(),
+          status: 'not_found',
+          hasNewContent: false,
+        };
+      }
+
+      const containerId = await this.findContainerId(serverId);
+      const serverStatus = await this.getServerStatus(serverId);
+
+      if (!containerId) {
+        return {
+          logs: 'Container not found',
+          hasErrors: false,
+          lastUpdate: new Date(),
+          status: serverStatus,
+          hasNewContent: false,
+        };
+      }
+
+      const { stdout, stderr } = await this.executeProcess('docker', ['logs', '--since', timestamp, '--timestamps', containerId]);
+      const logs = stdout + stderr;
+      const hasNewContent = logs.trim().length > 0;
+      const logAnalysis = this.analyzeLogs(logs);
+
+      return {
+        logs,
+        hasErrors: logAnalysis.hasErrors,
+        lastUpdate: new Date(),
+        status: serverStatus,
+        hasNewContent,
+      };
+    } catch (error) {
+      this.logger.error(`Failed to get logs since ${timestamp} for server ${serverId}`, error);
+      return {
+        logs: `Error retrieving logs: ${(error as Error).message}`,
+        hasErrors: true,
+        lastUpdate: new Date(),
+        status: 'not_found',
+        hasNewContent: false,
+      };
+    }
+  }
+
+  async getBackupSnapshots(serverId: string): Promise<BackupSnapshotsResponse> {
+    if (!this.validateServerId(serverId)) {
+      return { success: false, snapshots: [], error: 'Invalid server ID' };
+    }
+
+    try {
+      const { stdout } = await execAsync(DOCKER_COMMANDS.RESTIC_SNAPSHOTS(serverId), { maxBuffer: 10 * 1024 * 1024 });
+      const parsed = JSON.parse(stdout) as Array<Record<string, any>>;
+      const snapshots = parsed.map((snapshot) => ({
+        id: snapshot.id ?? '',
+        shortId: snapshot.short_id ?? String(snapshot.id ?? '').slice(0, 8),
+        time: snapshot.time ?? '',
+        paths: Array.isArray(snapshot.paths) ? snapshot.paths : [],
+        tags: Array.isArray(snapshot.tags) ? snapshot.tags : [],
+        hostname: snapshot.hostname ?? '',
+      }));
+      return { success: true, snapshots };
+    } catch (error) {
+      const message = (error as Error).message ?? '';
+      this.logger.warn(`Failed to list restic snapshots for server ${serverId}: ${message}`);
+      const friendly = message.includes('No such container') ? 'Backup container is not running' : 'Could not list snapshots from the restic repository';
+      return { success: false, snapshots: [], error: friendly };
+    }
+  }
+
+  async readPlayerLogWindow(serverId: string, since: Date, until: Date): Promise<{ runId: string; running: boolean; logs: string; truncated: boolean } | null> {
+    if (!this.validateServerId(serverId)) return null;
+    try {
+      const containerId = await this.findContainerId(serverId);
+      if (!containerId) return null;
+      const inspect = await this.executeProcess('docker', ['inspect', '--format', '{{json .State}}', containerId], { timeout: 5_000 });
+      if (inspect.exitCode !== 0) return null;
+      const state = JSON.parse(inspect.stdout) as { StartedAt: string; Running: boolean };
+      const result = await this.executeProcess('docker', ['logs', '--timestamps', '--tail', '10001', '--since', new Date(Math.max(since.getTime(), Date.parse(state.StartedAt) || 0)).toISOString(), '--until', until.toISOString(), containerId], { timeout: 5_000 });
+      if (result.exitCode !== 0) return null;
+      const logs = `${result.stdout}\n${result.stderr}`;
+      return { runId: `${containerId}:${state.StartedAt}`, running: state.Running, logs, truncated: logs.split('\n').filter(Boolean).length >= 10001 };
+    } catch {
+      return null;
+    }
+  }
+
+  async readTickStats(serverId: string, source: 'neoforge' | 'spark', rconPort: string, rconPassword?: string): Promise<CommandExecutionResponse> {
+    return this.readTickCommand(serverId, source === 'neoforge' ? 'neoforge tps' : 'spark tps', rconPort, rconPassword);
+  }
+
+  // Bounded, non-throwing RCON read for monitoring. Pass credentials explicitly (as executeCommand
+  // does) instead of trusting the container's own env, which goes stale if RCON settings change
+  // without a container recreate. The command is either fixed or an admin-chosen tick command
+  // (see updateTickCommand); it is passed as one argv entry, never through a shell.
+  async readTickCommand(serverId: string, command: string, rconPort: string, rconPassword?: string): Promise<CommandExecutionResponse> {
+    if (!this.validateServerId(serverId)) return { success: false, output: '' };
+    try {
+      if (!(await this.serverExists(serverId))) return { success: false, output: '' };
+      const containerId = await this.findContainerId(serverId);
+      if (!containerId) return { success: false, output: '' };
+      const args = ['exec', containerId, 'rcon-cli', '--port', rconPort];
+      if (rconPassword) args.push('--password', rconPassword);
+      // `--` ends rcon-cli's flags: a command such as `--host=evil` must stay the command.
+      args.push('--', command);
+      const { stdout, exitCode } = await this.executeProcess('docker', args, { timeout: 5_000 });
+      return { success: exitCode === 0, output: this.sanitizeCommandOutput(stdout) };
+    } catch {
+      return { success: false, output: '' };
+    }
+  }
+
+  // Rule names come from the server's own `help gamerule`, so version renames and modded rules
+  // need no hardcoded list. Since 1.21.11 game rules are a registry and help only prints
+  // `/gamerule <rule> [<value>]`; those servers fall back to the vanilla list, and
+  // `complete: false` tells the UI that modded rules may be missing.
+  async getGamerules(serverId: string): Promise<{ success: boolean; supported: boolean; complete: boolean; rules: { name: string; value: string }[] }> {
+    const empty = { success: false, supported: true, complete: false, rules: [] };
+    if (!this.validateServerId(serverId)) return empty;
+    try {
+      if (!(await this.serverExists(serverId))) return empty;
+      if ((await this.getServerEdition(serverId)) === 'BEDROCK') return { ...empty, supported: false };
+      const containerId = await this.findContainerId(serverId);
+      if (!containerId) return empty;
+
+      const help = await this.executeProcess('docker', ['exec', containerId, 'rcon-cli', 'help', 'gamerule'], { timeout: 10_000 });
+      if (help.exitCode !== 0) return empty;
+      const listed = this.parseGameruleNames(this.sanitizeCommandOutput(help.stdout));
+      const names = listed.length > 0 ? listed : REGISTRY_GAMERULES;
+
+      // One exec for all rules; names are argv, never interpolated into the script.
+      const script = 'for r do echo "@@$r@@"; rcon-cli gamerule "$r"; done';
+      const { stdout } = await this.executeProcess('docker', ['exec', containerId, 'sh', '-c', script, 'sh', ...names], { timeout: 30_000 });
+      const rules = this.parseGameruleValues(this.sanitizeCommandOutput(stdout), names);
+      return rules.length > 0 ? { success: true, supported: true, complete: listed.length > 0, rules } : empty;
+    } catch (error) {
+      this.logger.warn(`Failed to read gamerules for ${serverId}: ${(error as Error).message}`);
+      return empty;
+    }
+  }
+
+  private parseGameruleNames(helpOutput: string): string[] {
+    const names = new Set<string>();
+    // Usage is either one line per rule or `/gamerule (a|b|c)`; RCON may also glue lines together.
+    for (const [, usage] of helpOutput.matchAll(/gamerule\s+(\([^)]*\)|[^\s[/]+)/g)) {
+      for (const name of usage.split(/[()|]/)) {
+        if (/^[A-Za-z][\w.:-]{0,63}$/.test(name)) names.add(name);
+      }
+    }
+    return [...names].slice(0, 300);
+  }
+
+  private parseGameruleValues(output: string, names: string[]): { name: string; value: string }[] {
+    const known = new Set(names);
+    // Output is `@@name@@<reply>` per rule; sanitizing may drop the newlines between them.
+    const parts = output.split('@@');
+    const rules: { name: string; value: string }[] = [];
+    for (let i = 1; i + 1 < parts.length; i += 2) {
+      const value = /set to:?\s*([^\s@]+)/i.exec(parts[i + 1])?.[1];
+      if (known.has(parts[i]) && value) rules.push({ name: parts[i], value });
+    }
+    return rules;
+  }
+
+  async executeCommand(serverId: string, command: string, rconPort: string, rconPassword?: string): Promise<CommandExecutionResponse> {
+    try {
+      if (!this.validateServerId(serverId)) {
+        return { success: false, output: 'Invalid server ID' };
+      }
+
+      const normalizedCommand = this.normalizeCommandInput(command);
+      if (!normalizedCommand) {
+        return { success: false, output: 'Invalid command payload: command is empty after normalization' };
+      }
+
+      if (!(await this.serverExists(serverId))) {
+        return { success: false, output: 'Server not found' };
+      }
+
+      const containerId = await this.findContainerId(serverId);
+      if (!containerId) {
+        return { success: false, output: 'Container not found or not running' };
+      }
+
+      const edition = await this.getServerEdition(serverId);
+
+      // Use different command execution based on edition
+      if (edition === 'BEDROCK') {
+        // Bedrock uses send-command script (output only visible in container logs)
+        const { stderr } = await execAsync(DOCKER_COMMANDS.EXEC_BEDROCK(containerId, normalizedCommand));
+        const sanitizedStderr = this.sanitizeCommandOutput(stderr || '');
+
+        if (sanitizedStderr) {
+          this.logger.warn(`Command execution error on ${serverId}: ${sanitizedStderr}`);
+          return { success: false, output: `Execution failed: ${sanitizedStderr}` };
+        }
+
+        this.logger.log(`Bedrock command executed on ${serverId}: ${normalizedCommand}`);
+        return { success: true, output: 'Command sent (output visible in server logs)' };
+      }
+
+      // Java uses RCON with fallback argument styles for cross-platform reliability.
+      const rconResult = await this.executeRconWithFallback(containerId, rconPort, rconPassword, normalizedCommand);
+      if (!rconResult.success) {
+        const snakeCaseGameruleCommand = this.convertGameruleToSnakeCase(normalizedCommand);
+        if (snakeCaseGameruleCommand && this.isRconCommandError(rconResult.output)) {
+          const snakeCaseResult = await this.executeRconWithFallback(containerId, rconPort, rconPassword, snakeCaseGameruleCommand);
+          if (snakeCaseResult.success) {
+            this.logger.log(`Command executed on ${serverId}: ${snakeCaseGameruleCommand}`);
+            return snakeCaseResult;
+          }
+        }
+
+        this.logger.warn(`Command execution failed on ${serverId}: ${rconResult.output}`);
+        return rconResult;
+      }
+
+      this.logger.log(`Command executed on ${serverId}: ${normalizedCommand}`);
+      return rconResult;
+    } catch (error) {
+      this.logger.error(`Error executing command on server ${serverId}`, error);
+      return { success: false, output: `Execution failed: ${(error as Error).message}` };
+    }
+  }
+
+  async startServer(serverId: string): Promise<boolean> {
+    if (!exclusiveJavaEnabled()) return this.startRegularServer(serverId);
+    assertExclusiveProfile(serverId);
+    return this.exclusiveOperation.run(async () => {
+      const slot = await this.getExclusiveSlot();
+      if (slot && slot.profile !== serverId) throw this.exclusiveOccupied(slot.profile);
+      if (slot?.status === 'running') return true;
+      return this.startExclusiveProfile(serverId);
+    });
+  }
+
+
+  async beforeApplicationShutdown(signal?: string): Promise<void> {
+    if (!signal || process.env.MINEPANEL_HAOS !== 'true') return;
+    try {
+      await this.exclusiveOperation.drain();
+      const slot = await this.getExclusiveSlot();
+      if (slot?.status === 'running') await this.stopExclusiveSlot(slot);
+    } catch (error) {
+      this.logger.error('Minecraft shutdown could not be verified. Check the managed Minecraft container.', error);
+    }
+  }
+
+  async switchExclusiveProfile(sourceId: string, targetId: string): Promise<boolean> {
+    if (!exclusiveJavaEnabled()) throw new ConflictException('Exclusive Java mode is disabled');
+    assertExclusiveProfile(sourceId);
+    assertExclusiveProfile(targetId);
+    if (sourceId === targetId) throw new ConflictException('Choose a different target profile');
+
+    return this.exclusiveOperation.run(async () => {
+      const slot = await this.getExclusiveSlot();
+      if (!slot || slot.profile !== sourceId || slot.status !== 'running') {
+        throw new ConflictException('The selected source profile is no longer running');
+      }
+
+      // Validate the destination before asking the current server to shut down.
+      await this.prepareExclusiveStart(targetId);
+      await this.stopExclusiveSlot(slot);
+      return this.launchExclusiveProfile(targetId);
+    });
+  }
+
+  private exclusiveOccupied(profile: string): ConflictException {
+    return new ConflictException({ code: 'EXCLUSIVE_OCCUPIED', activeProfile: profile, message: 'The other Minecraft profile owns the runtime slot' });
+  }
+
+  private async getExclusiveSlot(): Promise<ExclusiveSlot | null> {
+    try {
+      // Search by service label as well as verifying the fixed name. A legacy Compose
+      // container on the dedicated daemon must never be mistaken for a free runtime slot.
+      const filter = process.env.MINEPANEL_HAOS === 'true' ? HAOS_MC_LABEL + '=true' : 'com.docker.compose.service=mc';
+      const { stdout } = await execRead('docker ps -a -q --no-trunc --filter label=' + filter);
+      const ids = stdout.trim().split(/\s+/).filter(Boolean);
+      if (ids.length === 0) return null;
+      const [id] = ids;
+      if (ids.length !== 1 || !/^[a-f0-9]{64}$/.test(id)) throw new Error('Unexpected Minecraft containers');
+
+      const inspection = await execDocker(['inspect', '--format', '{{.Name}}\t{{index .Config.Labels "com.docker.compose.project"}}\t{{.State.Status}}', id]);
+      const [name, project, status] = inspection.stdout.trim().split('\t');
+      const profile = EXCLUSIVE_MC_PROFILES.find((candidate) => this.getComposeProjectName(candidate) === project);
+      if (name !== `/${EXCLUSIVE_MC_CONTAINER}` || !profile || !['running', 'exited', 'created'].includes(status)) {
+        throw new Error('The Minecraft container does not match the exclusive deployment');
+      }
+      return { id, profile, status };
+    } catch (error) {
+      this.logger.warn(`Could not establish the exclusive Minecraft slot: ${(error as Error).message}`);
+      throw new ConflictException('Minecraft runtime state could not be verified');
+    }
+  }
+
+  private async prepareExclusiveStart(serverId: string): Promise<void> {
+    const support = await execRead('docker info --format "{{.MemoryLimit}} {{.SwapLimit}}"');
+    if (support.stdout.trim() !== 'true true') {
+      throw new ConflictException('Docker memory and swap limits are required');
+    }
+    if (!this.hostDirIsKnown(serverId) || !(await this.composeService.refreshComposeFile(serverId, false))) {
+      throw new ConflictException('The target Minecraft profile could not be prepared');
+    }
+  }
+
+  private async startExclusiveProfile(serverId: string): Promise<boolean> {
+    await this.prepareExclusiveStart(serverId);
+    return this.launchExclusiveProfile(serverId);
+  }
+
+  private async launchExclusiveProfile(serverId: string): Promise<boolean> {
+    const slot = await this.getExclusiveSlot();
+    if (slot && slot.profile !== serverId) throw this.exclusiveOccupied(slot.profile);
+    if (slot?.status === 'running') return true;
+    // An explicit start of the same profile can recover its own exited container.
+    if (slot) await this.execComposeDown(serverId);
+    await this.execComposeCommand(serverId, DOCKER_COMMANDS.COMPOSE_UP);
+    void this.notifyWhenReady(serverId, 'started');
+    return true;
+  }
+
+  private async stopExclusiveSlot(slot: ExclusiveSlot): Promise<void> {
+    const { id, profile, status } = slot;
+    if (status !== 'running') {
+      throw new ConflictException('Minecraft did not finish a verified shutdown. Restart the same profile to recover it.');
+    }
+
+    try {
+      const save = await execRead(`docker exec ${id} rcon-cli "save-all flush"`, { timeout: 60_000 });
+      if (!/\bSaved the game\b/i.test(save.stdout)) throw new Error('Minecraft did not confirm the save');
+
+      this.alertsService.markExpectedStop(profile, 180_000);
+      this.cancelReadyWatch(profile);
+      await execRead(`docker exec ${id} rcon-cli stop`, { timeout: 20_000 });
+      const wait = await execRead(`docker wait ${id}`, { timeout: 120_000 });
+      if (wait.stdout.trim() !== '0') throw new Error('Minecraft returned a non-zero exit code');
+
+      const ended = await execRead(`docker inspect --format="{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}" ${id}`);
+      if (ended.stdout.trim() !== 'exited 0 false') throw new Error('Docker did not confirm a clean exit');
+
+      await this.execPlannedComposeDown(profile);
+      if (await this.getExclusiveSlot()) throw new Error('The Minecraft slot remains occupied');
+      void this.sendServerNotification('stopped', profile);
+    } catch (error) {
+      this.logger.warn(`Could not verify the shutdown of ${profile}: ${(error as Error).message}`);
+      throw new ConflictException('Minecraft save or shutdown could not be verified');
+    }
+  }
+
+  private async startRegularServer(serverId: string): Promise<boolean> {
+    try {
+      if (!this.validateServerId(serverId)) {
+        this.logger.error(`Invalid server ID: ${serverId}`);
+        return false;
+      }
+
+      const dockerComposePath = this.getDockerComposePath(serverId);
+      if (!(await fs.pathExists(dockerComposePath))) {
+        this.logger.error(`Docker compose file does not exist for server ${serverId}`);
+        return false;
+      }
+
+      if (!this.hostDirIsKnown(serverId)) {
+        return false;
+      }
+
+      // The compose file is derived from server.json, so refresh it here instead
+      // of trusting whatever was written the last time someone pressed save. This
+      // covers every way a server runs: the UI, the scheduler, and the mc-router
+      // wake-up webhook.
+      await this.refreshComposeFile(serverId);
+
+      const mcDataPath = this.getMcDataPath(serverId);
+      if (await fs.pathExists(mcDataPath)) {
+        const entries = await fs.readdir(mcDataPath);
+        if (entries.length === 0) {
+          this.logger.warn(`Server ${serverId}: mc-data folder is empty. The server will generate a new world. ` + `If you uploaded existing server data, make sure it's placed in servers/${serverId}/mc-data/`);
+        }
+      }
+
+      // Fix permissions for Bedrock servers (they require UID/GID 1000)
+      const edition = await this.getServerEdition(serverId);
+      if (edition === 'BEDROCK') {
+        await this.fixBedrockPermissions(serverId);
+      }
+
+      if ((await this.getServerStatus(serverId)) !== 'not_found') {
+        await this.execComposeDown(serverId);
+      }
+
+      await this.execComposeCommand(serverId, DOCKER_COMMANDS.COMPOSE_UP);
+
+      this.logger.log(`Server ${serverId} started successfully`);
+      void this.notifyWhenReady(serverId, 'started');
+
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to start server ${serverId}`, error);
+      void this.sendServerNotification('error', serverId, { reason: 'Failed to start server' });
+      return false;
+    }
+  }
+
+  private async fixBedrockPermissions(serverId: string): Promise<void> {
+    try {
+      const mcDataPath = this.getMcDataPath(serverId);
+      if (!(await fs.pathExists(mcDataPath))) {
+        return;
+      }
+
+      // Host path: the mount is resolved by the daemon, not inside this container.
+      const hostMcDataPath = path.join(this.SERVERS_HOST_DIR, serverId, 'mc-data');
+
+      // Read UID/GID from docker-compose if available, default to 1000
+      let uid = '1000';
+      let gid = '1000';
+      try {
+        const composePath = this.getDockerComposePath(serverId);
+        if (await fs.pathExists(composePath)) {
+          const content = await fs.readFile(composePath, 'utf-8');
+          const compose = yaml.load(content) as any;
+          uid = compose?.services?.mc?.environment?.UID || '1000';
+          gid = compose?.services?.mc?.environment?.GID || '1000';
+        }
+      } catch {
+        // Use defaults
+      }
+
+      // Coerce to numeric ids so they can never carry shell metacharacters, even from a tampered compose file
+      const safeUid = /^\d+$/.test(uid) ? uid : '1000';
+      const safeGid = /^\d+$/.test(gid) ? gid : '1000';
+
+      this.logger.log(`Fixing permissions for Bedrock server ${serverId} (${safeUid}:${safeGid})...`);
+      await this.executeProcess('docker', ['run', '--rm', '-v', `${hostMcDataPath}:/data`, 'alpine', 'chown', '-R', `${safeUid}:${safeGid}`, '/data']);
+      this.logger.log(`Permissions fixed for ${serverId}`);
+    } catch (error) {
+      this.logger.warn(`Could not fix permissions for ${serverId}: ${(error as Error).message}`);
+      // Continue anyway - might work if permissions are already correct
+    }
+  }
+
+  // A normal stop is slow by design: the itzg image announces the shutdown in
+  // chat and waits STOP_SERVER_ANNOUNCE_DELAY (60s by default) before stopping.
+  // RCON "stop" skips the announcement and still saves the world.
+  async forceStopServer(serverId: string): Promise<boolean> {
+    if (exclusiveJavaEnabled()) throw new ConflictException('This action is disabled in exclusive Java mode');
+    try {
+      if (!this.validateServerId(serverId)) {
+        this.logger.error(`Invalid server ID: ${serverId}`);
+        return false;
+      }
+
+      const dockerComposePath = this.getDockerComposePath(serverId);
+      if (!(await fs.pathExists(dockerComposePath))) {
+        this.logger.error(`Docker compose file does not exist for server ${serverId}`);
+        return false;
+      }
+
+      this.alertsService.markExpectedStop(serverId);
+      this.cancelReadyWatch(serverId);
+
+      const edition = await this.getServerEdition(serverId);
+      if (edition !== 'BEDROCK') {
+        await this.requestRconStop(serverId);
+      }
+
+      // Anything still up gets a 10s grace period instead of the announce delay.
+      await this.execComposeCommand(serverId, DOCKER_COMMANDS.COMPOSE_DOWN(this.FORCE_STOP_GRACE_SECONDS));
+
+      this.logger.log(`Server ${serverId} force stopped`);
+      void this.sendServerNotification('stopped', serverId);
+
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to force stop server ${serverId}`, error);
+      void this.sendServerNotification('error', serverId, { reason: 'Failed to force stop server' });
+      return false;
+    }
+  }
+
+  // rcon-cli reads RCON_PORT/RCON_PASSWORD from the container env, so the server
+  // config is not needed here. Returns true when the container exited on its own.
+  private async requestRconStop(serverId: string): Promise<boolean> {
+    const containerId = await this.findContainerId(serverId);
+    if (!containerId) return false;
+
+    try {
+      const { exitCode } = await this.executeProcess('docker', ['exec', containerId, 'rcon-cli', 'stop']);
+      if (exitCode !== 0) {
+        this.logger.warn(`RCON stop rejected for ${serverId}, falling back to compose shutdown`);
+        return false;
+      }
+    } catch (error) {
+      this.logger.warn(`RCON stop unavailable for ${serverId}: ${(error as Error).message}`);
+      return false;
+    }
+
+    for (let attempt = 0; attempt < this.FORCE_STOP_POLL_ATTEMPTS; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, this.FORCE_STOP_POLL_INTERVAL_MS));
+      if ((await this.getServerStatus(serverId)) !== 'running') return true;
+    }
+
+    this.logger.warn(`Server ${serverId} did not exit after RCON stop`);
+    return false;
+  }
+
+  async stopServer(serverId: string): Promise<boolean> {
+    if (!exclusiveJavaEnabled()) return this.stopRegularServer(serverId);
+    assertExclusiveProfile(serverId);
+    return this.exclusiveOperation.run(async () => {
+      const slot = await this.getExclusiveSlot();
+      if (!slot || slot.profile !== serverId) return true;
+      await this.stopExclusiveSlot(slot);
+      return true;
+    });
+  }
+
+  private async stopRegularServer(serverId: string): Promise<boolean> {
+    try {
+      if (!this.validateServerId(serverId)) {
+        this.logger.error(`Invalid server ID: ${serverId}`);
+        return false;
+      }
+
+      const dockerComposePath = this.getDockerComposePath(serverId);
+      if (!(await fs.pathExists(dockerComposePath))) {
+        this.logger.error(`Docker compose file does not exist for server ${serverId}`);
+        return false;
+      }
+
+      this.alertsService.markExpectedStop(serverId);
+      this.cancelReadyWatch(serverId);
+      await this.execPlannedComposeDown(serverId);
+
+      this.logger.log(`Server ${serverId} stopped successfully`);
+      void this.sendServerNotification('stopped', serverId);
+
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to stop server ${serverId}`, error);
+      void this.sendServerNotification('error', serverId, { reason: 'Failed to stop server' });
+      return false;
+    }
+  }
+
+  // ==================== PLAYER MANAGEMENT ====================
+  // Las acciones (whitelist add/remove, op/deop, kick, ban, pardon) usan executeCommand directamente
+
+  async getOnlinePlayers(serverId: string, rconPort: string, rconPassword?: string): Promise<{ online: number; max: number; players: string[]; supportsRcon: boolean }> {
+    try {
+      const edition = await this.getServerEdition(serverId);
+
+      if (edition === 'BEDROCK') {
+        // Bedrock: send 'list' and parse response from logs
+        return await this.getBedrockOnlinePlayers(serverId);
+      }
+
+      // Java: use RCON
+      const result = await this.executeCommand(serverId, 'list', rconPort, rconPassword);
+      if (!result.success) {
+        return { online: 0, max: 0, players: [], supportsRcon: true };
+      }
+
+      // Parse "There are X of a max of Y players online: player1, player2"
+      const match = /There are (\d+) of a max of (\d+) players online[:\s]*(.*)/i.exec(result.output);
+      if (match) {
+        const online = Number.parseInt(match[1], 10);
+        const max = Number.parseInt(match[2], 10);
+        const playerList = match[3]?.trim();
+        const players = playerList
+          ? playerList
+              .split(',')
+              .map((p) => p.trim())
+              .filter(Boolean)
+          : [];
+        return { online, max, players, supportsRcon: true };
+      }
+
+      return { online: 0, max: 0, players: [], supportsRcon: true };
+    } catch (error) {
+      this.logger.error(`Failed to get online players for ${serverId}`, error);
+      return { online: 0, max: 0, players: [], supportsRcon: true };
+    }
+  }
+
+  private async getBedrockOnlinePlayers(serverId: string): Promise<{ online: number; max: number; players: string[]; supportsRcon: boolean }> {
+    try {
+      const containerId = await this.findContainerId(serverId);
+      if (!containerId) {
+        return { online: 0, max: 0, players: [], supportsRcon: false };
+      }
+
+      // Send list command
+      await execAsync(DOCKER_COMMANDS.EXEC_BEDROCK(containerId, 'list'));
+
+      // Wait for command to process
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Read recent logs to find the response
+      const { stdout: logs } = await execRead(DOCKER_COMMANDS.LOGS(containerId, 20));
+
+      // Bedrock format: "There are X/Y players online:"
+      const match = /There are (\d+)\/(\d+) players online[:\s]*(.*)/i.exec(logs);
+      if (match) {
+        const online = Number.parseInt(match[1], 10);
+        const max = Number.parseInt(match[2], 10);
+        const playerList = match[3]?.trim();
+        const players = playerList
+          ? playerList
+              .split(',')
+              .map((p) => p.trim())
+              .filter(Boolean)
+          : [];
+        return { online, max, players, supportsRcon: false };
+      }
+
+      return { online: 0, max: 0, players: [], supportsRcon: false };
+    } catch (error) {
+      this.logger.error(`Failed to get Bedrock online players for ${serverId}`, error);
+      return { online: 0, max: 0, players: [], supportsRcon: false };
+    }
+  }
+
+  async getWhitelist(serverId: string): Promise<Array<{ uuid: string; name: string }>> {
+    try {
+      const whitelistPath = path.join(this.getMcDataPath(serverId), 'whitelist.json');
+      if (!(await fs.pathExists(whitelistPath))) {
+        return [];
+      }
+      await assertContained(this.getMcDataPath(serverId), whitelistPath);
+      const content = await fs.readFile(whitelistPath, 'utf-8');
+      return JSON.parse(content);
+    } catch (error) {
+      this.logger.error(`Failed to read whitelist for ${serverId}`, error);
+      return [];
+    }
+  }
+
+  async getOps(serverId: string): Promise<Array<{ uuid: string; name: string; level: number; bypassesPlayerLimit: boolean }>> {
+    try {
+      const opsPath = path.join(this.getMcDataPath(serverId), 'ops.json');
+      if (!(await fs.pathExists(opsPath))) {
+        return [];
+      }
+      await assertContained(this.getMcDataPath(serverId), opsPath);
+      const content = await fs.readFile(opsPath, 'utf-8');
+      return JSON.parse(content);
+    } catch (error) {
+      this.logger.error(`Failed to read ops for ${serverId}`, error);
+      return [];
+    }
+  }
+
+  async getBannedPlayers(serverId: string): Promise<Array<{ uuid: string; name: string; created: string; source: string; reason: string }>> {
+    try {
+      const bannedPath = path.join(this.getMcDataPath(serverId), 'banned-players.json');
+      if (!(await fs.pathExists(bannedPath))) {
+        return [];
+      }
+      await assertContained(this.getMcDataPath(serverId), bannedPath);
+      const content = await fs.readFile(bannedPath, 'utf-8');
+      return JSON.parse(content);
+    } catch (error) {
+      this.logger.error(`Failed to read banned players for ${serverId}`, error);
+      return [];
+    }
+  }
+}

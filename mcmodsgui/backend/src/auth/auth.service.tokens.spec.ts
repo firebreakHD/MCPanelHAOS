@@ -1,0 +1,223 @@
+import { BadRequestException, InternalServerErrorException, ServiceUnavailableException } from '@nestjs/common';
+import { createHash } from 'node:crypto';
+import { IsNull } from 'typeorm';
+
+jest.mock('bcrypt', () => ({
+  hash: jest.fn(async (value: string) => `hashed:${value}`),
+  compare: jest.fn(async (value: string, hash: string) => hash === `hashed:${value}`),
+}));
+
+import { AuthService } from './auth.service';
+
+const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
+
+describe('AuthService tokens, recovery and invitations', () => {
+  let service: AuthService;
+  let jwtService: { sign: jest.Mock; decode: jest.Mock };
+  let usersService: Record<string, jest.Mock>;
+  let configService: { get: jest.Mock };
+  let authMail: Record<string, jest.Mock>;
+  let audit: { record: jest.Mock };
+  let instanceSettings: { getOidc: jest.Mock };
+  let refreshRepo: Record<string, jest.Mock>;
+  let resetRepo: any;
+
+  beforeEach(() => {
+    jwtService = { sign: jest.fn().mockReturnValue('access'), decode: jest.fn().mockReturnValue({ iat: 100, exp: 1000 }) };
+    usersService = {
+      findOrProvisionOidcUser: jest.fn().mockResolvedValue({ id: 5, username: 'sso', role: 'USER' }),
+      createInitialAdmin: jest.fn().mockResolvedValue({ id: 1, username: 'root', role: 'ADMIN' }),
+      getUserByEmail: jest.fn(),
+      createInvitation: jest.fn(),
+      getActiveInvitations: jest.fn(),
+      getInvitationLink: jest.fn().mockResolvedValue('https://panel/?inviteToken=t'),
+      getInvitationByToken: jest.fn(),
+      acceptInvitation: jest.fn().mockResolvedValue({ id: 9, username: 'newbie', role: 'USER' }),
+      hasUsers: jest.fn().mockResolvedValue(true),
+    };
+    configService = { get: jest.fn((key: string) => ({ frontendUrl: 'https://panel.example.com', passwordResetTokenExpiresInMinutes: 30 })[key]) };
+    authMail = {
+      isConfigured: jest.fn().mockResolvedValue(true),
+      sendPasswordResetEmail: jest.fn().mockResolvedValue(undefined),
+      sendUserInvitationEmail: jest.fn().mockResolvedValue(undefined),
+    };
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
+    instanceSettings = { getOidc: jest.fn().mockResolvedValue({ enabled: true, providerName: 'Authentik', disablePasswordLogin: true }) };
+    refreshRepo = { delete: jest.fn().mockResolvedValue(undefined), save: jest.fn().mockResolvedValue(undefined), find: jest.fn().mockResolvedValue([]), findOne: jest.fn().mockResolvedValue(null), update: jest.fn().mockResolvedValue(undefined) };
+    resetRepo = { update: jest.fn().mockResolvedValue(undefined), save: jest.fn().mockResolvedValue(undefined), findOne: jest.fn(), manager: { save: jest.fn().mockResolvedValue(undefined), delete: jest.fn().mockResolvedValue(undefined) } };
+
+    service = new AuthService(jwtService as any, usersService as any, configService as any, authMail as any, audit as any, instanceSettings as any, refreshRepo as any, resetRepo as any);
+  });
+
+  it('getSetupStatus exposes SSO state', async () => {
+    expect(await service.getSetupStatus()).toEqual({
+      requiresSetup: false,
+      passwordRecoveryEnabled: true,
+      sso: { enabled: true, providerName: 'Authentik', passwordLoginDisabled: true, loginUrl: '/auth/oidc/login' },
+    });
+  });
+
+  it('loginWithOidc and createInitialAdmin issue sessions', async () => {
+    const sso = await service.loginWithOidc({ sub: 'x' });
+    expect(sso).toMatchObject({ access_token: 'access', username: 'sso', userId: 5, expires_in: 900 });
+    expect(refreshRepo.delete).toHaveBeenCalled();
+    expect(refreshRepo.save).toHaveBeenCalledWith(expect.objectContaining({ userId: 5, revoked: false }));
+
+    jwtService.decode.mockReturnValue(null);
+    const admin = await service.createInitialAdmin({ username: 'root', email: 'r@x.com', password: 'secret12' });
+    expect(admin.expires_in).toBe(900);
+  });
+
+  it('refreshSession rotates a valid token and rejects expired or inactive ones', async () => {
+    const future = new Date(Date.now() + 10 * 60_000);
+    const past = new Date(Date.now() - 10_000);
+    const bob = { id: 2, username: 'bob', role: 'USER', isActive: true };
+    refreshRepo.findOne.mockResolvedValueOnce({ id: 2, token: sha256('mine'), expiresAt: future, user: bob }).mockResolvedValueOnce({ id: 2, revoked: false });
+    expect(await service.refreshSession('mine')).toMatchObject({ access_token: 'access', username: 'bob', expires_in: 900 });
+    expect(refreshRepo.findOne).toHaveBeenCalledWith(expect.objectContaining({ where: { token: sha256('mine'), revoked: false } }));
+    expect(refreshRepo.find).not.toHaveBeenCalled();
+    const graceEnd = refreshRepo.update.mock.calls[0][1].expiresAt as Date;
+    expect(refreshRepo.update).toHaveBeenCalledWith(2, { expiresAt: graceEnd });
+    expect(graceEnd.getTime()).toBeGreaterThan(Date.now());
+    expect(graceEnd.getTime()).toBeLessThanOrEqual(Date.now() + 60_000);
+    expect(refreshRepo.save).toHaveBeenCalledWith(expect.objectContaining({ userId: 2, revoked: false }));
+
+    // A token about to expire is not extended by the grace window.
+    const soon = new Date(Date.now() + 5_000);
+    refreshRepo.findOne.mockResolvedValueOnce({ id: 5, token: sha256('soon'), expiresAt: soon, user: bob }).mockResolvedValueOnce({ id: 5, revoked: false });
+    expect(await service.refreshSession('soon')).toMatchObject({ username: 'bob' });
+    expect(refreshRepo.update).toHaveBeenCalledWith(5, { expiresAt: soon });
+
+    refreshRepo.findOne.mockResolvedValueOnce({ id: 3, token: sha256('old'), expiresAt: past, user: { isActive: true } });
+    expect(await service.refreshSession('old')).toBeNull();
+    expect(refreshRepo.update).toHaveBeenLastCalledWith(3, { revoked: true });
+
+    refreshRepo.findOne.mockResolvedValueOnce({ id: 4, token: sha256('dis'), expiresAt: future, user: { isActive: false } });
+    expect(await service.refreshSession('dis')).toBeNull();
+
+    refreshRepo.findOne.mockResolvedValueOnce(null);
+    expect(await service.refreshSession('unknown')).toBeNull();
+  });
+
+  it('refreshSession revokes the pair it issued when a password reset raced the rotation', async () => {
+    const future = new Date(Date.now() + 10 * 60_000);
+    const bob = { id: 2, username: 'bob', role: 'USER', isActive: true };
+    refreshRepo.findOne.mockResolvedValueOnce({ id: 2, token: sha256('mine'), expiresAt: future, user: bob }).mockResolvedValueOnce({ id: 2, revoked: true });
+    expect(await service.refreshSession('mine')).toBeNull();
+    const issued = refreshRepo.save.mock.calls[0][0].token;
+    expect(refreshRepo.update).toHaveBeenLastCalledWith({ token: issued }, { revoked: true });
+
+    // The cleanup of a concurrent save may already have deleted the revoked row.
+    refreshRepo.findOne.mockResolvedValueOnce({ id: 2, token: sha256('mine'), expiresAt: future, user: bob }).mockResolvedValueOnce(null);
+    expect(await service.refreshSession('mine')).toBeNull();
+  });
+
+  it('refreshSession still accepts tokens stored with bcrypt before the sha256 switch', async () => {
+    const future = new Date(Date.now() + 10 * 60_000);
+    refreshRepo.find.mockResolvedValue([
+      { id: 1, token: 'hashed:other', expiresAt: future, user: { id: 1, isActive: true } },
+      { id: 2, token: 'hashed:mine', expiresAt: future, user: { id: 2, username: 'bob', role: 'USER', isActive: true } },
+    ]);
+    refreshRepo.findOne.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: 2, revoked: false });
+    expect(await service.refreshSession('mine')).toMatchObject({ username: 'bob' });
+    expect(refreshRepo.find).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ revoked: false, expiresAt: expect.anything() }) }));
+    expect(refreshRepo.update).toHaveBeenCalledWith(2, expect.objectContaining({ expiresAt: expect.any(Date) }));
+  });
+
+  it('revokeRefreshToken revokes only the matching token', async () => {
+    refreshRepo.findOne.mockResolvedValue({ id: 2, token: sha256('b') });
+    await service.revokeRefreshToken('b');
+    expect(refreshRepo.update).toHaveBeenCalledTimes(1);
+    expect(refreshRepo.update).toHaveBeenCalledWith(2, { revoked: true });
+
+    refreshRepo.findOne.mockResolvedValue(null);
+    refreshRepo.find.mockResolvedValue([{ id: 1, token: 'hashed:a' }]);
+    await service.revokeRefreshToken('zzz');
+    expect(refreshRepo.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('createPasswordReset requires smtp and silently ignores unknown or inactive users', async () => {
+    authMail.isConfigured.mockResolvedValueOnce(false);
+    await expect(service.createPasswordReset('a@x.com')).rejects.toThrow(ServiceUnavailableException);
+
+    usersService.getUserByEmail.mockResolvedValueOnce(null);
+    await service.createPasswordReset('a@x.com');
+    usersService.getUserByEmail.mockResolvedValueOnce({ isActive: false, email: 'a@x.com' });
+    await service.createPasswordReset('a@x.com');
+    expect(resetRepo.save).not.toHaveBeenCalled();
+  });
+
+  it('createPasswordReset stores a hashed token with the configured ttl and emails the link', async () => {
+    usersService.getUserByEmail.mockResolvedValue({ id: 3, username: 'carol', email: 'c@x.com', isActive: true });
+
+    await service.createPasswordReset('c@x.com');
+
+    expect(resetRepo.update).toHaveBeenCalledWith({ userId: 3, usedAt: IsNull() }, { usedAt: expect.any(Date) });
+    const saved = resetRepo.save.mock.calls[0][0];
+    expect(saved.expiresAt.getTime() - Date.now()).toBeGreaterThan(29 * 60 * 1000);
+    const [to, username, url] = authMail.sendPasswordResetEmail.mock.calls[0];
+    expect([to, username]).toEqual(['c@x.com', 'carol']);
+    const token = new URL(url).searchParams.get('resetToken')!;
+    expect(saved.tokenHash).toBe(sha256(token));
+  });
+
+  it('createPasswordReset wraps mail failures and missing FRONTEND_URL', async () => {
+    usersService.getUserByEmail.mockResolvedValue({ id: 3, username: 'carol', email: 'c@x.com', isActive: true });
+    authMail.sendPasswordResetEmail.mockRejectedValueOnce(new Error('smtp'));
+    await expect(service.createPasswordReset('c@x.com')).rejects.toThrow(InternalServerErrorException);
+
+    // A missing FRONTEND_URL surfaces while building the link, inside the mail try/catch.
+    configService.get.mockImplementation((key: string) => (key === 'passwordResetTokenExpiresInMinutes' ? -1 : undefined));
+    await expect(service.createPasswordReset('c@x.com')).rejects.toThrow(InternalServerErrorException);
+    expect(resetRepo.save.mock.calls.at(-1)[0].expiresAt.getTime() - Date.now()).toBeGreaterThan(59 * 60 * 1000);
+  });
+
+  it('resetPassword rejects unknown, used, expired tokens and inactive users', async () => {
+    const future = new Date(Date.now() + 10_000);
+    resetRepo.findOne.mockResolvedValueOnce(null);
+    await expect(service.resetPassword('t', 'newpass1')).rejects.toThrow(BadRequestException);
+    resetRepo.findOne.mockResolvedValueOnce({ usedAt: new Date(), expiresAt: future, user: { isActive: true } });
+    await expect(service.resetPassword('t', 'newpass1')).rejects.toThrow(BadRequestException);
+    resetRepo.findOne.mockResolvedValueOnce({ usedAt: null, expiresAt: new Date(Date.now() - 1), user: { isActive: true } });
+    await expect(service.resetPassword('t', 'newpass1')).rejects.toThrow(BadRequestException);
+    resetRepo.findOne.mockResolvedValueOnce({ usedAt: null, expiresAt: future, user: { isActive: false } });
+    await expect(service.resetPassword('t', 'newpass1')).rejects.toThrow(BadRequestException);
+    expect(resetRepo.manager.save).not.toHaveBeenCalled();
+  });
+
+  it('resetPassword consumes only unused tokens for the user', async () => {
+    resetRepo.findOne.mockResolvedValue({
+      userId: 3,
+      usedAt: null,
+      expiresAt: new Date(Date.now() + 10_000),
+      user: { id: 3, isActive: true, password: 'old' },
+    });
+
+    await service.resetPassword('t', 'newpass1');
+
+    expect(resetRepo.update).toHaveBeenCalledWith({ userId: 3, usedAt: IsNull() }, { usedAt: expect.any(Date) });
+  });
+
+  it('manages invitations with audit entries', async () => {
+    usersService.createInvitation.mockResolvedValue({ invitation: { id: 7, email: null, role: 'USER', permissions: {}, serverAccess: null, expiresAt: new Date() }, inviteUrl: 'u', token: 't' });
+    const created = await service.createInvitation({}, { userId: 1, username: 'admin', role: 'ADMIN' }, true);
+    expect(created).toMatchObject({ id: 7, emailSent: false, access: { serverAccess: [] } });
+    expect(authMail.sendUserInvitationEmail).not.toHaveBeenCalled();
+    expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({ action: 'create_invitation', summary: 'Created invitation' }));
+
+    usersService.getActiveInvitations.mockResolvedValue([{ id: 8, email: 'e', role: 'USER', permissions: null, serverAccess: ['s'], expiresAt: new Date(), createdAt: new Date() }]);
+    expect(await service.getActiveInvitations()).toEqual([expect.objectContaining({ id: 8, access: { permissions: null, serverAccess: ['s'] } })]);
+
+    expect(await service.getInvitationLink(8, { userId: 1, username: 'admin', role: 'ADMIN' }, true)).toEqual({ inviteUrl: 'https://panel/?inviteToken=t' });
+    expect(usersService.getInvitationLink).toHaveBeenLastCalledWith(8, true);
+    expect(audit.record).toHaveBeenLastCalledWith(expect.objectContaining({ action: 'copy_invitation_link', metadata: { invitationId: 8 } }));
+
+    usersService.getInvitationByToken.mockResolvedValue({ email: 'e', role: 'USER', permissions: null, serverAccess: null, expiresAt: new Date() });
+    expect(await service.getInvitation('t')).toMatchObject({ email: 'e', access: { serverAccess: [] } });
+
+    const session = await service.acceptInvitation('t', 'newbie', 'secret12', 'n@x.com');
+    expect(usersService.acceptInvitation).toHaveBeenCalledWith('t', { username: 'newbie', password: 'secret12', email: 'n@x.com' });
+    expect(session).toMatchObject({ access_token: 'access', username: 'newbie' });
+    expect(audit.record).toHaveBeenLastCalledWith(expect.objectContaining({ action: 'accept_invitation', actorUserId: 9 }));
+  });
+});

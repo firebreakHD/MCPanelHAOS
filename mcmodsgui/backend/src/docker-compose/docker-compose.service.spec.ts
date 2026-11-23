@@ -1,0 +1,981 @@
+import { Test, TestingModule } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
+import { DockerComposeService } from './docker-compose.service';
+import { ServerStoreService } from './server-store.service';
+import { InstanceSettingsService } from 'src/settings/instance-settings.service';
+import * as fs from 'fs-extra';
+import * as yaml from 'js-yaml';
+import { sep } from 'node:path';
+
+jest.mock('node:child_process', () => ({
+  exec: jest.fn((_: string, callback: (error: Error | null, result: { stdout: string; stderr: string }) => void) => {
+    callback(null, { stdout: '', stderr: '' });
+  }),
+}));
+
+jest.mock('fs-extra', () => ({
+  ensureDirSync: jest.fn(),
+  ensureDir: jest.fn().mockResolvedValue(undefined),
+  writeFile: jest.fn().mockResolvedValue(undefined),
+  rename: jest.fn().mockResolvedValue(undefined),
+  writeJson: jest.fn().mockResolvedValue(undefined),
+  readJson: jest.fn().mockResolvedValue({}),
+  move: jest.fn().mockResolvedValue(undefined),
+  remove: jest.fn().mockResolvedValue(undefined),
+  pathExists: jest.fn().mockResolvedValue(false),
+  readFile: jest.fn(),
+  existsSync: jest.fn().mockReturnValue(false),
+  readdir: jest.fn().mockResolvedValue([]),
+}));
+
+// The store is exercised in its own spec; here it only has to stay out of the
+// way so these tests keep covering compose generation and parsing.
+const makeStoreStub = () => ({
+  getConfigPath: jest.fn((id: string) => '/app/servers/' + id + '/server.json'),
+  readConfig: jest.fn().mockResolvedValue(null),
+  writeConfig: jest.fn().mockResolvedValue(undefined),
+  readIndex: jest.fn().mockResolvedValue(null),
+  writeIndex: jest.fn().mockResolvedValue(undefined),
+  removeFromIndex: jest.fn().mockResolvedValue(undefined),
+  listServerDirs: jest.fn().mockResolvedValue([]),
+  toIndexEntry: jest.fn((config) => ({ id: config.id, port: config.port })),
+});
+
+describe('DockerComposeService', () => {
+  let service: DockerComposeService;
+  const getNetwork = jest.fn();
+
+  const SERVERS_DIR = '/app/servers';
+  const BASE_DIR = '/app';
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    getNetwork.mockResolvedValue({ publicIp: null, lanIp: null });
+
+    const mockConfigService = {
+      get: jest.fn((key: string) => {
+        if (key === 'serversDir') return SERVERS_DIR;
+        if (key === 'serversHostDir') return `${BASE_DIR}/servers`;
+        return null;
+      }),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        DockerComposeService,
+        { provide: ConfigService, useValue: mockConfigService },
+        { provide: ServerStoreService, useValue: makeStoreStub() },
+        { provide: InstanceSettingsService, useValue: { getNetwork } },
+      ],
+    }).compile();
+
+    service = module.get<DockerComposeService>(DockerComposeService);
+  });
+
+  const makeService = async (backupBaseDir?: string, serversHostDir?: string): Promise<DockerComposeService> => {
+    const mockConfigService = {
+      get: jest.fn((key: string) => {
+        if (key === 'serversDir') return SERVERS_DIR;
+        if (key === 'serversHostDir') return serversHostDir ?? `${BASE_DIR}/servers`;
+        if (key === 'backupBaseDir') return backupBaseDir ?? null;
+        return null;
+      }),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        DockerComposeService,
+        { provide: ConfigService, useValue: mockConfigService },
+        { provide: ServerStoreService, useValue: makeStoreStub() },
+        { provide: InstanceSettingsService, useValue: { getNetwork } },
+      ],
+    }).compile();
+
+    return module.get<DockerComposeService>(DockerComposeService);
+  };
+
+  const generateMcVolumes = async (svc: DockerComposeService, config: any): Promise<string[]> => {
+    await svc.generateDockerComposeFile(config, false);
+    const writeFileMock = fs.writeFile as unknown as jest.Mock;
+    const [, yamlContent] = writeFileMock.mock.calls[writeFileMock.mock.calls.length - 1];
+    const parsed = yaml.load(yamlContent as string) as any;
+    return parsed.services.mc.volumes as string[];
+  };
+
+  const generateBackupVolumes = async (svc: DockerComposeService, config: any): Promise<string[]> => {
+    await svc.generateDockerComposeFile(config, false);
+    const writeFileMock = fs.writeFile as unknown as jest.Mock;
+    const [, yamlContent] = writeFileMock.mock.calls[writeFileMock.mock.calls.length - 1];
+    const parsed = yaml.load(yamlContent as string) as any;
+    return parsed.services.backup.volumes as string[];
+  };
+
+  it('should be defined', () => {
+    expect(service).toBeDefined();
+  });
+
+  describe('getAllServerIds', () => {
+    it('should return empty array when no servers exist', async () => {
+      const result = await service.getAllServerIds();
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('getServerConfig', () => {
+    it('should return null when server does not exist', async () => {
+      const result = await service.getServerConfig('nonexistent');
+      expect(result).toBeNull();
+    });
+
+    it('should keep extra ports when loading a proxy compose file', async () => {
+      const compose = {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: {
+              ID_MANAGER: 'proxy-server',
+              TYPE: 'VANILLA',
+            },
+            expose: ['25565'],
+            ports: ['24454:24454/udp', '8123:8123'],
+            labels: ['minepanel.proxy.enabled=true'],
+          },
+        },
+      };
+
+      const existsSyncMock = fs.existsSync as unknown as jest.Mock;
+      existsSyncMock.mockImplementation((target: string) =>
+        target === `${SERVERS_DIR}/proxy-server` || target === `${SERVERS_DIR}/proxy-server/docker-compose.yml`
+      );
+
+      const readFileMock = fs.readFile as unknown as jest.Mock;
+      readFileMock.mockResolvedValue(yaml.dump(compose));
+
+      const result = await service.getServerConfig('proxy-server');
+
+      expect(result).not.toBeNull();
+      expect(result?.port).toBe('25565');
+      expect(result?.extraPorts).toEqual(['24454:24454/udp', '8123:8123']);
+    });
+
+    it('should read object-style proxy labels with boolean enabled state', async () => {
+      const compose = {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: {
+              ID_MANAGER: 'proxy-server',
+              TYPE: 'VANILLA',
+            },
+            expose: ['25565'],
+            labels: {
+              'minepanel.proxy.enabled': true,
+              'minepanel.proxy.hostname': 'lobby',
+            },
+          },
+        },
+      };
+
+      const existsSyncMock = fs.existsSync as unknown as jest.Mock;
+      existsSyncMock.mockImplementation((target: string) =>
+        target === `${SERVERS_DIR}/proxy-server` || target === `${SERVERS_DIR}/proxy-server/docker-compose.yml`
+      );
+
+      const readFileMock = fs.readFile as unknown as jest.Mock;
+      readFileMock.mockResolvedValue(yaml.dump(compose));
+
+      const result = await service.getServerConfig('proxy-server');
+
+      expect(result).not.toBeNull();
+      expect(result?.useProxy).toBe(true);
+      expect(result?.proxyHostname).toBe('lobby');
+    });
+
+    const loadFromCompose = async (id: string, compose: unknown) => {
+      (fs.existsSync as unknown as jest.Mock).mockImplementation((target: string) =>
+        target === `${SERVERS_DIR}/${id}` || target === `${SERVERS_DIR}/${id}/docker-compose.yml`
+      );
+      (fs.readFile as unknown as jest.Mock).mockResolvedValue(yaml.dump(compose));
+      return service.getServerConfig(id);
+    };
+
+    it('should read back values the writer used to drop', async () => {
+      const result = await loadFromCompose('java-server', {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: {
+              ID_MANAGER: 'java-server',
+              TYPE: 'VANILLA',
+              SPAWN_PROTECTION: '16',
+            },
+          },
+        },
+      });
+
+      expect(result?.spawnProtection).toBe('16');
+      // and it no longer leaks into the user's custom env textarea
+      expect(result?.envVars ?? '').not.toContain('SPAWN_PROTECTION');
+    });
+
+    it('should read GENERIC_PACK into its own field instead of the custom env textarea', async () => {
+      const result = await loadFromCompose('java-server', {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: {
+              ID_MANAGER: 'java-server',
+              TYPE: 'NEOFORGE',
+              GENERIC_PACK: '/modpacks/tensura.zip',
+            },
+          },
+        },
+      });
+
+      expect(result?.genericPack).toBe('/modpacks/tensura.zip');
+      // A copy in envVars would survive clearing the field and keep re-emitting the pack.
+      expect(result?.envVars ?? '').not.toContain('GENERIC_PACK');
+    });
+
+    it('should read INITIAL_ENABLED_PACKS into experimentalPacks instead of the custom env textarea', async () => {
+      const result = await loadFromCompose('java-server', {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: { ID_MANAGER: 'java-server', TYPE: 'VANILLA', INITIAL_ENABLED_PACKS: 'minecart_improvements, trade_rebalance' },
+          },
+        },
+      });
+
+      expect(result?.experimentalPacks).toEqual(['minecart_improvements', 'trade_rebalance']);
+      expect(result?.envVars ?? '').not.toContain('INITIAL_ENABLED_PACKS');
+    });
+
+    it('should keep INITIAL_ENABLED_PACKS in envVars when it names a pack the panel does not offer', async () => {
+      const result = await loadFromCompose('java-server', {
+        services: { mc: { image: 'itzg/minecraft-server:latest', environment: { ID_MANAGER: 'java-server', TYPE: 'VANILLA', INITIAL_ENABLED_PACKS: 'update_1_20,bundle' } } },
+      });
+
+      // Otherwise the DTO would reject every later save of this unchanged config.
+      expect(result?.experimentalPacks).toEqual([]);
+      expect(result?.envVars).toContain('INITIAL_ENABLED_PACKS=update_1_20,bundle');
+    });
+
+    it('should read RCON_CMDS_* into the event command fields instead of the custom env textarea', async () => {
+      const result = await loadFromCompose('java-server', {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: { ID_MANAGER: 'java-server', TYPE: 'VANILLA', RCON_CMDS_STARTUP: 'team add New\nteam add Old', RCON_CMDS_LAST_DISCONNECT: 'save-all' },
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ rconCmdsStartup: 'team add New\nteam add Old', rconCmdsLastDisconnect: 'save-all', rconCmdsOnConnect: '' });
+      expect(result?.envVars ?? '').not.toContain('RCON_CMDS');
+    });
+
+    it('should read VANILLATWEAKS_SHARECODE into vanillaTweaksCodes instead of the custom env textarea', async () => {
+      const result = await loadFromCompose('java-server', {
+        services: { mc: { image: 'itzg/minecraft-server:latest', environment: { ID_MANAGER: 'java-server', TYPE: 'VANILLA', VANILLATWEAKS_SHARECODE: 'MGr52E, tF1zL2' } } },
+      });
+      expect(result?.vanillaTweaksCodes).toEqual(['MGr52E', 'tF1zL2']);
+      expect(result?.envVars ?? '').not.toContain('VANILLATWEAKS');
+    });
+
+    it('should read the Bedrock seed and game mode from the keys Bedrock writes', async () => {
+      const result = await loadFromCompose('bedrock-server', {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-bedrock-server:latest',
+            environment: {
+              ID_MANAGER: 'bedrock-server',
+              GAMEMODE: 'creative',
+              LEVEL_SEED: '12345',
+              SERVER_PORT_V6: '19133',
+            },
+          },
+        },
+      });
+
+      expect(result?.edition).toBe('BEDROCK');
+      expect(result?.gameMode).toBe('creative');
+      expect(result?.seed).toBe('12345');
+      expect(result?.serverPortV6).toBe('19133');
+      const envVars = result?.envVars ?? '';
+      expect(envVars).not.toContain('LEVEL_SEED');
+      expect(envVars).not.toContain('SERVER_PORT_V6');
+    });
+
+    it('should read the whitelist from the env keys each edition writes', async () => {
+      const withPlayers = await loadFromCompose('java-server', {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: { ID_MANAGER: 'java-server', TYPE: 'VANILLA', WHITELIST: 'alice,bob' },
+          },
+        },
+      });
+      expect(withPlayers?.whitelistPlayers).toBe('alice,bob');
+      expect(withPlayers?.whiteList).toBe(true);
+      expect(withPlayers?.envVars ?? '').not.toContain('WHITELIST');
+
+      const closedButEmpty = await loadFromCompose('java-server', {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: { ID_MANAGER: 'java-server', TYPE: 'VANILLA', ENABLE_WHITELIST: 'true' },
+          },
+        },
+      });
+      expect(closedButEmpty?.whiteList).toBe(true);
+      expect(closedButEmpty?.whitelistPlayers).toBe('');
+
+      const bedrock = await loadFromCompose('bedrock-server', {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-bedrock-server:latest',
+            environment: { ID_MANAGER: 'bedrock-server', WHITE_LIST: 'true' },
+          },
+        },
+      });
+      expect(bedrock?.whiteList).toBe(true);
+    });
+
+    it('should read the auto-scale opt-out label', async () => {
+      const compose = {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: {
+              ID_MANAGER: 'proxy-server',
+              TYPE: 'VANILLA',
+            },
+            expose: ['25565'],
+            labels: ['minepanel.proxy.enabled=true', 'minepanel.autoscale.enabled=false'],
+          },
+        },
+      };
+
+      const existsSyncMock = fs.existsSync as unknown as jest.Mock;
+      existsSyncMock.mockImplementation((target: string) =>
+        target === `${SERVERS_DIR}/proxy-server` || target === `${SERVERS_DIR}/proxy-server/docker-compose.yml`
+      );
+
+      const readFileMock = fs.readFile as unknown as jest.Mock;
+      readFileMock.mockResolvedValue(yaml.dump(compose));
+
+      const result = await service.getServerConfig('proxy-server');
+
+      expect(result?.useAutoScale).toBe(false);
+    });
+
+    it('should default auto-scaling to enabled when the label is absent', async () => {
+      const compose = {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: {
+              ID_MANAGER: 'proxy-server',
+              TYPE: 'VANILLA',
+            },
+            expose: ['25565'],
+            labels: ['minepanel.proxy.enabled=true'],
+          },
+        },
+      };
+
+      const existsSyncMock = fs.existsSync as unknown as jest.Mock;
+      existsSyncMock.mockImplementation((target: string) =>
+        target === `${SERVERS_DIR}/proxy-server` || target === `${SERVERS_DIR}/proxy-server/docker-compose.yml`
+      );
+
+      const readFileMock = fs.readFile as unknown as jest.Mock;
+      readFileMock.mockResolvedValue(yaml.dump(compose));
+
+      const result = await service.getServerConfig('proxy-server');
+
+      expect(result?.useAutoScale).toBe(true);
+    });
+
+    const loadWithBackupVolume = async (svc: DockerComposeService, id: string, hostPath: string) => {
+      const compose = {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: { ID_MANAGER: id, TYPE: 'VANILLA' },
+          },
+          backup: {
+            image: 'itzg/mc-backup',
+            environment: { DEST_DIR: '/backups' },
+            volumes: [`${BASE_DIR}/servers/${id}/mc-data:/data:ro`, `${hostPath}:/backups`],
+          },
+        },
+      };
+
+      (fs.existsSync as unknown as jest.Mock).mockImplementation((target: string) =>
+        target === `${SERVERS_DIR}/${id}` || target === `${SERVERS_DIR}/${id}/docker-compose.yml`
+      );
+      (fs.readFile as unknown as jest.Mock).mockResolvedValue(yaml.dump(compose));
+
+      return svc.getServerConfig(id);
+    };
+
+    it('should leave backupHostDir undefined for the default backups mount', async () => {
+      const result = await loadWithBackupVolume(service, 'rt-default', `${BASE_DIR}/servers/rt-default/backups`);
+
+      expect(result?.enableBackup).toBe(true);
+      expect(result?.backupHostDir).toBeUndefined();
+    });
+
+    it('should read backupHostDir from a custom backups mount', async () => {
+      const result = await loadWithBackupVolume(service, 'rt-custom', '/network-disk/custom');
+
+      expect(result?.backupHostDir).toBe('/network-disk/custom');
+    });
+
+    it('should leave backupHostDir undefined when the mount matches the global base', async () => {
+      const svc = await makeService('/nas/minepanel');
+
+      const result = await loadWithBackupVolume(svc, 'rt-global', '/nas/minepanel/rt-global');
+
+      expect(result?.backupHostDir).toBeUndefined();
+    });
+  });
+
+  // Servers created before 1.12 are imported from their compose file, which holds the
+  // absolute host paths the panel generated at the time. Keeping those verbatim would pin
+  // the server to the old BASE_DIR, and a named volume resolves somewhere else entirely.
+  describe('importing a pre-1.12 compose file', () => {
+    const NAMED_VOLUME_HOST_DIR = '/var/lib/docker/volumes/minepanel_servers/_data';
+
+    const importLegacyServer = async (volumes: string[], serversHostDir?: string) => {
+      const compose = {
+        services: {
+          mc: {
+            image: 'itzg/minecraft-server:latest',
+            environment: { ID_MANAGER: 'legacy', TYPE: 'VANILLA' },
+            expose: ['25565'],
+            volumes,
+          },
+        },
+      };
+
+      const existsSyncMock = fs.existsSync as unknown as jest.Mock;
+      existsSyncMock.mockImplementation((target: string) => target === `${SERVERS_DIR}/legacy` || target === `${SERVERS_DIR}/legacy/docker-compose.yml`);
+
+      const readFileMock = fs.readFile as unknown as jest.Mock;
+      readFileMock.mockResolvedValue(yaml.dump(compose));
+
+      const svc = await makeService(undefined, serversHostDir);
+      return svc.getServerConfig('legacy');
+    };
+
+    it('rewrites the old absolute paths so the detected host dir wins', async () => {
+      const result = await importLegacyServer([`${BASE_DIR}/servers/legacy/mc-data:/data`, `${BASE_DIR}/servers/legacy/modpacks:/modpacks:ro`], NAMED_VOLUME_HOST_DIR);
+
+      expect(result?.dockerVolumes).toBe('./mc-data:/data\n./modpacks:/modpacks:ro');
+    });
+
+    it('drops the global world library mount, which is panel-wide and re-added on generation', async () => {
+      const result = await importLegacyServer([
+        `${BASE_DIR}/servers/legacy/mc-data:/data`,
+        `${BASE_DIR}/servers/legacy/worlds:/data/.world-library/local:ro`,
+        `${BASE_DIR}/servers/.world/worlds:/data/.world-library/global:ro`,
+      ]);
+
+      expect(result?.dockerVolumes).toBe('./mc-data:/data\n./worlds:/data/.world-library/local:ro');
+    });
+
+    it('leaves a host path outside the server directory alone', async () => {
+      const result = await importLegacyServer([`${BASE_DIR}/servers/legacy/mc-data:/data`, '/mnt/nas/shared:/shared:ro']);
+
+      expect(result?.dockerVolumes).toBe('./mc-data:/data\n/mnt/nas/shared:/shared:ro');
+    });
+
+    it('leaves a deliberate bind on a managed target alone when it lives elsewhere', async () => {
+      const result = await importLegacyServer([`${BASE_DIR}/servers/legacy/modpacks:/modpacks:ro`, '/mnt/bigdisk/minecraft/legacy:/data']);
+
+      expect(result?.dockerVolumes).toBe('./modpacks:/modpacks:ro\n/mnt/bigdisk/minecraft/legacy:/data');
+    });
+
+    it('does not mistake the old default backup path for a custom one', async () => {
+      const result = await importLegacyServer([`${BASE_DIR}/servers/legacy/mc-data:/data`, `${BASE_DIR}/servers/legacy/backups:/backups`], NAMED_VOLUME_HOST_DIR);
+
+      expect(result?.backupHostDir).toBeUndefined();
+    });
+  });
+
+  // Most servers upgraded from pre-1.12 already have absolute paths sitting in server.json,
+  // written against whatever the host dir resolved to at import time. Generation has to
+  // re-derive the panel's own mounts instead of trusting them, or the host-dir detection
+  // never reaches those servers.
+  describe('rebasing stored absolute mounts on generation', () => {
+    const NAMED_VOLUME_HOST_DIR = '/var/lib/docker/volumes/minepanel_servers/_data';
+
+    const configWithVolumes = (svc: DockerComposeService, id: string, dockerVolumes: string) => {
+      const config = (svc as any).createDefaultConfig(id);
+      config.dockerVolumes = dockerVolumes;
+      return config;
+    };
+
+    it('re-derives the panel mounts from the current host dir', async () => {
+      const svc = await makeService(undefined, NAMED_VOLUME_HOST_DIR);
+      const config = configWithVolumes(svc, 'stale', `/old/base/servers/stale/mc-data:/data\n/old/base/servers/stale/modpacks:/modpacks:ro`);
+
+      const volumes = await generateMcVolumes(svc, config);
+
+      expect(volumes).toContain(`${NAMED_VOLUME_HOST_DIR}/stale/mc-data:/data`);
+      expect(volumes).toContain(`${NAMED_VOLUME_HOST_DIR}/stale/modpacks:/modpacks:ro`);
+      expect(volumes.some((volume) => volume.startsWith('/old/base'))).toBe(false);
+    });
+
+    it('re-derives both world library mounts', async () => {
+      const svc = await makeService(undefined, NAMED_VOLUME_HOST_DIR);
+      const config = configWithVolumes(
+        svc,
+        'stale',
+        `/old/base/servers/stale/mc-data:/data\n/old/base/servers/stale/worlds:/data/.world-library/local:ro\n/old/base/servers/.world/worlds:/data/.world-library/global:ro`,
+      );
+
+      const volumes = await generateMcVolumes(svc, config);
+
+      expect(volumes).toContain(`${NAMED_VOLUME_HOST_DIR}/stale/worlds:/data/.world-library/local:ro`);
+      expect(volumes).toContain(`${NAMED_VOLUME_HOST_DIR}/.world/worlds:/data/.world-library/global:ro`);
+    });
+
+    it('leaves a deliberate bind on a managed target where the operator put it', async () => {
+      const svc = await makeService(undefined, NAMED_VOLUME_HOST_DIR);
+      const config = configWithVolumes(svc, 'bigworld', '/mnt/bigdisk/minecraft/bigworld:/data');
+
+      const volumes = await generateMcVolumes(svc, config);
+
+      expect(volumes).toContain('/mnt/bigdisk/minecraft/bigworld:/data');
+    });
+
+    it('leaves a bind on an unmanaged target alone even inside the server directory', async () => {
+      const svc = await makeService(undefined, NAMED_VOLUME_HOST_DIR);
+      const config = configWithVolumes(svc, 'stale', '/old/base/servers/stale/scripts:/scripts:ro');
+
+      const volumes = await generateMcVolumes(svc, config);
+
+      expect(volumes).toContain('/old/base/servers/stale/scripts:/scripts:ro');
+    });
+
+    it('is a no-op once the stored paths already match the host dir', async () => {
+      const config = configWithVolumes(service, 'current', `${BASE_DIR}/servers/current/mc-data:/data`);
+
+      const volumes = await generateMcVolumes(service, config);
+
+      expect(volumes).toContain(`${BASE_DIR}/servers/current/mc-data:/data`);
+    });
+  });
+
+
+  describe('exclusive Java compose', () => {
+    beforeEach(() => { process.env.MINEPANEL_EXCLUSIVE_JAVA = 'true'; });
+    afterEach(() => { delete process.env.MINEPANEL_EXCLUSIVE_JAVA; });
+
+    it('provisions independent mounts with the same port and container name and an effective memory limit', async () => {
+      const generated = (fs.writeFile as unknown as jest.Mock).mock.calls;
+      const first = await service.createServer('modpack-a', { maxMemory: '10G', restartPolicy: 'always' });
+      await service.createServer('modpack-b', { port: '25566', enableBackup: true });
+      expect(first).toMatchObject({ initMemory: '2G', maxMemory: '4G', port: '25565', restartPolicy: 'no' });
+      const [a, b] = generated.map(([, data]) => (yaml.load(data) as any).services);
+      for (const { mc } of [a, b]) {
+        expect(mc).toMatchObject({
+          container_name: 'minepanel-exclusive-mc',
+          mem_limit: '5120M',
+          memswap_limit: '5120M',
+          restart: 'no',
+          ports: ['25565:25565'],
+          environment: { INIT_MEMORY: '2G', MAX_MEMORY: '4G' },
+        });
+      }
+      expect(a.mc.volumes.map((entry: string) => entry.split(sep).join('/'))).toContain('/app/servers/modpack-a/mc-data:/data');
+      expect(b.mc.volumes.map((entry: string) => entry.split(sep).join('/'))).toContain('/app/servers/modpack-b/mc-data:/data');
+      expect(b.backup.restart).toBe('no');
+      await expect(service.createServer('third')).rejects.toThrow('Only modpack-a and modpack-b');
+    });
+  });
+
+  describe('generateDockerComposeFile', () => {
+    const generateBedrock = async (overrides: Record<string, unknown> = {}) => {
+      const config = { ...(service as any).createDefaultConfig('bedrock'), edition: 'BEDROCK', port: '19140', ...overrides };
+      await service.generateDockerComposeFile(config, false);
+      const [, yamlContent] = (fs.writeFile as unknown as jest.Mock).mock.calls[0];
+      return (yaml.load(yamlContent as string) as any).services.mc;
+    };
+
+    it('should publish the Bedrock game port over UDP and TCP for NetherNet', async () => {
+      const mc = await generateBedrock({ extraPorts: ['8080:8080'] });
+
+      expect(mc.ports).toEqual(['19140:19132/udp', '19140:19132/tcp', '8080:8080']);
+      expect(mc.environment.TRANSPORT).toBe('nethernet');
+      expect(mc.environment.SERVER_UDP_PORTS).toBe('<public_ipv4>:19140:19132');
+    });
+
+    it.each(['19140:19132', '19140:19132/TCP', '0.0.0.0:19140:19132/tcp', '[::]:19140:19132'])(
+      'should not publish the Bedrock TCP port twice when %s is already an extra port',
+      async (extra) => {
+        const mc = await generateBedrock({ extraPorts: [extra] });
+
+        expect(mc.ports).toEqual(['19140:19132/udp', extra]);
+      },
+    );
+
+    it('should advertise the configured public IP literal to NetherNet clients', async () => {
+      getNetwork.mockResolvedValueOnce({ publicIp: '203.0.113.10', lanIp: null });
+      expect((await generateBedrock()).environment.SERVER_UDP_PORTS).toBe('203.0.113.10:19140:19132');
+
+      (fs.writeFile as unknown as jest.Mock).mockClear();
+      getNetwork.mockResolvedValueOnce({ publicIp: '2001:db8::1', lanIp: null });
+      expect((await generateBedrock()).environment.SERVER_UDP_PORTS).toBe('[2001:db8::1]:19140:19132');
+
+      (fs.writeFile as unknown as jest.Mock).mockClear();
+      getNetwork.mockResolvedValueOnce({ publicIp: 'play.example.com', lanIp: null });
+      expect((await generateBedrock()).environment.SERVER_UDP_PORTS).toBe('<public_ipv4>:19140:19132');
+    });
+
+    it('should keep a SERVER_UDP_PORTS custom env var', async () => {
+      const mc = await generateBedrock({ envVars: 'SERVER_UDP_PORTS=192.168.1.10:19140:19132' });
+
+      expect(mc.environment.SERVER_UDP_PORTS).toBe('192.168.1.10:19140:19132');
+    });
+
+    it('should not set NetherNet settings on Java servers', async () => {
+      const config = (service as any).createDefaultConfig('java');
+      await service.generateDockerComposeFile(config, false);
+      const [, yamlContent] = (fs.writeFile as unknown as jest.Mock).mock.calls[0];
+      const mc = (yaml.load(yamlContent as string) as any).services.mc;
+
+      expect(mc.ports).toEqual(['25565:25565']);
+      expect(mc.environment.SERVER_UDP_PORTS).toBeUndefined();
+      expect(getNetwork).not.toHaveBeenCalled();
+    });
+
+    it('should use english default motd for new servers', () => {
+      const config = (service as any).createDefaultConfig('survival');
+
+      expect(config.motd).toBe('An incredible Minecraft server');
+    });
+
+    it('should persist the default port when the configured port is empty', async () => {
+      const config = (service as any).createDefaultConfig('default-port');
+      config.port = '';
+
+      await service.generateDockerComposeFile(config, false);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.mc.ports).toContain('25565:25565');
+      expect(config.port).toBe('25565');
+    });
+
+    it('should keep the memory reservation within the memory limit', async () => {
+      const config = (service as any).createDefaultConfig('small');
+      config.maxMemory = '2G';
+      config.memoryReservation = '4G';
+
+      await service.generateDockerComposeFile(config, false);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.mc.environment.MAX_MEMORY).toBe('2G');
+      expect(parsed.services.mc.deploy.resources.limits.memory).toBe('3072M');
+      expect(parsed.services.mc.deploy.resources.reservations.memory).toBe('3072M');
+    });
+
+    it('should leave a memory reservation below the limit alone', async () => {
+      const config = (service as any).createDefaultConfig('big');
+      config.maxMemory = '8G';
+      config.memoryReservation = '1024M';
+
+      await service.generateDockerComposeFile(config, false);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.mc.deploy.resources.reservations.memory).toBe('1024M');
+    });
+
+    it('should generate mc service without container_name', async () => {
+      const config = (service as any).createDefaultConfig('survival');
+
+      await service.generateDockerComposeFile(config, false);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.mc.container_name).toBeUndefined();
+    });
+
+    it('should add stable proxy alias when proxy is enabled', async () => {
+      const config = (service as any).createDefaultConfig('proxyserver');
+
+      await service.generateDockerComposeFile(config, true);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.mc.networks['minepanel-network'].aliases).toEqual(['proxyserver']);
+    });
+
+    describe('with Velocity as the edge', () => {
+      const generate = async (overrides: Record<string, unknown>) => {
+        const config = { ...(service as any).createDefaultConfig('lobby'), serverType: 'PAPER', onlineMode: true, ...overrides };
+        await service.generateDockerComposeFile(config, 'velocity');
+        const writeFileMock = fs.writeFile as unknown as jest.Mock;
+        return yaml.load(writeFileMock.mock.calls[0][1] as string) as any;
+      };
+
+      it('puts a member on the panel network, with no host port and offline mode', async () => {
+        const parsed = await generate({ velocityEnabled: true });
+
+        expect(parsed.services.mc.ports).toBeUndefined();
+        expect(parsed.services.mc.networks['minepanel-network'].aliases).toEqual(['lobby']);
+        expect(parsed.services.mc.environment.ONLINE_MODE).toBe('FALSE');
+        expect(parsed.networks['minepanel-network']).toEqual({ external: true });
+      });
+
+      it('keeps a non-member on its own host port and online mode, and off the 25565 the proxy owns', async () => {
+        const parsed = await generate({ velocityEnabled: false });
+
+        expect(parsed.services.mc.ports).toContain('25566:25565');
+        expect(parsed.services.mc.networks).toBeUndefined();
+        expect(parsed.services.mc.environment.ONLINE_MODE).toBe('true');
+      });
+
+      it('overrides an ONLINE_MODE set through custom env vars for a member', async () => {
+        const parsed = await generate({ velocityEnabled: true, envVars: 'ONLINE_MODE=TRUE' });
+
+        expect(parsed.services.mc.environment.ONLINE_MODE).toBe('FALSE');
+      });
+    });
+
+    it('should reserve port 25565 for direct java servers when global proxy is enabled', async () => {
+      const config = (service as any).createDefaultConfig('direct-server');
+      config.useProxy = false;
+
+      await service.generateDockerComposeFile(config, true);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.mc.ports).toContain('25566:25565');
+    });
+
+    it('should reserve port 25565 when mc-router or Velocity is running even if global proxy is disabled', async () => {
+      const childProcess = jest.requireMock('node:child_process') as { exec: jest.Mock };
+      childProcess.exec.mockImplementation((_: string, callback: (error: Error | null, result: { stdout: string; stderr: string }) => void) => {
+        callback(null, { stdout: 'router-id\n', stderr: '' });
+      });
+
+      const config = (service as any).createDefaultConfig('router-running-server');
+
+      await service.generateDockerComposeFile(config, false);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.mc.ports).toContain('25566:25565');      expect(childProcess.exec).toHaveBeenCalledWith(expect.stringContaining('name=^/mc-velocity$'), expect.any(Function));
+    });
+
+    it('should attach backup service to proxy network when proxy is enabled', async () => {
+      const config = (service as any).createDefaultConfig('proxybackup');
+      config.enableBackup = true;
+
+      await service.generateDockerComposeFile(config, true);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.backup.networks['minepanel-network']).toEqual({});
+    });
+
+    it('should mount the default backups path when no custom dir is configured', async () => {
+      const config = (service as any).createDefaultConfig('backup-default');
+      config.enableBackup = true;
+
+      const volumes = await generateBackupVolumes(service, config);
+
+      expect(volumes).toContain(`${BASE_DIR}/servers/backup-default/backups:/backups`);
+    });
+
+    it('should mount backups under BACKUP_BASE_DIR when the global base is set', async () => {
+      const svc = await makeService('/nas/minepanel');
+      const config = (svc as any).createDefaultConfig('backup-global');
+      config.enableBackup = true;
+
+      const volumes = await generateBackupVolumes(svc, config);
+
+      expect(volumes).toContain('/nas/minepanel/backup-global:/backups');
+    });
+
+    it('should let per-server backupHostDir override the global base', async () => {
+      const svc = await makeService('/nas/minepanel');
+      const config = (svc as any).createDefaultConfig('backup-override');
+      config.enableBackup = true;
+      config.backupHostDir = '/network-disk/custom';
+
+      const volumes = await generateBackupVolumes(svc, config);
+
+      expect(volumes).toContain('/network-disk/custom:/backups');
+    });
+
+    it('should emit restic env vars when the restic backup method is selected', async () => {
+      const config = (service as any).createDefaultConfig('restic-server');
+      config.enableBackup = true;
+      config.backupMethod = 'restic';
+      config.resticRepository = 's3:https://s3.amazonaws.com/my-bucket/minecraft';
+      config.resticPassword = 'secret-pass';
+      config.resticS3AccessKeyId = 'AKIA123';
+      config.resticS3SecretAccessKey = 's3cr3t';
+
+      await service.generateDockerComposeFile(config, false);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+      const backupEnv = parsed.services.backup.environment;
+
+      expect(backupEnv.RESTIC_REPOSITORY).toBe('s3:https://s3.amazonaws.com/my-bucket/minecraft');
+      expect(backupEnv.RESTIC_PASSWORD).toBe('secret-pass');
+      expect(backupEnv.PRUNE_RESTIC_RETENTION).toBe('--keep-within 7d');
+      expect(backupEnv.RESTIC_HOSTNAME).toBe('restic-server');
+      expect(backupEnv.AWS_ACCESS_KEY_ID).toBe('AKIA123');
+      expect(backupEnv.AWS_SECRET_ACCESS_KEY).toBe('s3cr3t');
+    });
+
+    it('should not emit restic or aws env vars for the default tar method', async () => {
+      const config = (service as any).createDefaultConfig('tar-server');
+      config.enableBackup = true;
+
+      await service.generateDockerComposeFile(config, false);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+      const backupEnv = parsed.services.backup.environment;
+
+      expect(backupEnv.RESTIC_REPOSITORY).toBeUndefined();
+      expect(backupEnv.RESTIC_PASSWORD).toBeUndefined();
+      expect(backupEnv.PRUNE_RESTIC_RETENTION).toBeUndefined();
+      expect(backupEnv.RESTIC_HOSTNAME).toBeUndefined();
+      expect(backupEnv.AWS_ACCESS_KEY_ID).toBeUndefined();
+    });
+
+    it('should round-trip restic settings through the generated compose file', async () => {
+      const config = (service as any).createDefaultConfig('restic-roundtrip');
+      config.enableBackup = true;
+      config.backupMethod = 'restic';
+      config.resticRepository = 's3:https://minio.local:9000/backups';
+      config.resticPassword = 'round-trip-pass';
+      config.resticS3AccessKeyId = 'minio-key';
+      config.resticS3SecretAccessKey = 'minio-secret';
+      config.resticRetention = '--keep-daily 7';
+
+      await service.generateDockerComposeFile(config, false);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+
+      (fs.existsSync as unknown as jest.Mock).mockImplementation((target: string) =>
+        target === `${SERVERS_DIR}/restic-roundtrip` || target === `${SERVERS_DIR}/restic-roundtrip/docker-compose.yml`
+      );
+      (fs.readFile as unknown as jest.Mock).mockResolvedValue(yamlContent);
+
+      const loaded = await service.getServerConfig('restic-roundtrip');
+
+      expect(loaded?.backupMethod).toBe('restic');
+      expect(loaded?.resticRepository).toBe('s3:https://minio.local:9000/backups');
+      expect(loaded?.resticPassword).toBe('round-trip-pass');
+      expect(loaded?.resticS3AccessKeyId).toBe('minio-key');
+      expect(loaded?.resticS3SecretAccessKey).toBe('minio-secret');
+      expect(loaded?.resticRetention).toBe('--keep-daily 7');
+    });
+
+    it('should force restart policy to "no" when auto-stop is enabled', async () => {
+      const config = (service as any).createDefaultConfig('autostop-server');
+      config.enableAutoStop = true;
+      config.restartPolicy = 'always';
+
+      await service.generateDockerComposeFile(config, false);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.mc.restart).toBe('no');
+    });
+
+    it('should add the retry limit to on-failure', async () => {
+      const config = (service as any).createDefaultConfig('crash-server');
+      config.restartPolicy = 'on-failure';
+      config.restartMaxRetries = 3;
+
+      await service.generateDockerComposeFile(config, false);
+
+      const [, yamlContent] = (fs.writeFile as unknown as jest.Mock).mock.calls[0];
+      expect((yaml.load(yamlContent as string) as any).services.mc.restart).toBe('on-failure:3');
+    });
+
+    it('should ignore the retry limit for other policies', async () => {
+      const config = (service as any).createDefaultConfig('always-server');
+      config.restartPolicy = 'always';
+      config.restartMaxRetries = 3;
+
+      await service.generateDockerComposeFile(config, false);
+
+      const [, yamlContent] = (fs.writeFile as unknown as jest.Mock).mock.calls[0];
+      expect((yaml.load(yamlContent as string) as any).services.mc.restart).toBe('always');
+    });
+
+    it('should read an on-failure retry limit back from a compose file', () => {
+      expect((service as any).parseRestart('on-failure:5')).toEqual({ restartPolicy: 'on-failure', restartMaxRetries: 5 });
+      expect((service as any).parseRestart('unless-stopped')).toEqual({ restartPolicy: 'unless-stopped' });
+      expect((service as any).parseRestart(undefined)).toEqual({ restartPolicy: 'no' });
+    });
+
+    it('should merge compose snippets into the generated file', async () => {
+      const config = (service as any).createDefaultConfig('snippet-server');
+      config.composeSnippets = [
+        { target: 'mc', yaml: 'networks:\n  custom: {}' },
+        { target: 'root', yaml: 'networks:\n  custom:\n    external: true' },
+      ];
+
+      await service.generateDockerComposeFile(config, false);
+
+      const [, yamlContent] = (fs.writeFile as unknown as jest.Mock).mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.mc.networks).toEqual({ custom: {} });
+      expect(parsed.networks).toEqual({ custom: { external: true } });
+      expect(parsed.services.mc.image).toBeDefined();
+    });
+
+    it('should generate valid yaml for docker labels with urls when proxy labels are also present', async () => {
+      const config = (service as any).createDefaultConfig('label-server');
+      config.dockerLabels = 'example.label=https://example.com/icon.png';
+
+      await service.generateDockerComposeFile(config, true);
+
+      const writeFileMock = fs.writeFile as unknown as jest.Mock;
+      const [, yamlContent] = writeFileMock.mock.calls[0];
+      const parsed = yaml.load(yamlContent as string) as any;
+
+      expect(parsed.services.mc.labels['example.label']).toBe('https://example.com/icon.png');
+      expect(parsed.services.mc.labels['minepanel.proxy.enabled']).toBe('true');
+    });
+  });
+});

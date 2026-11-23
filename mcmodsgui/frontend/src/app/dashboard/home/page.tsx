@@ -1,0 +1,247 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import Image from "next/image";
+import Link from "next/link";
+import { Activity, HardDrive, Cpu, Plus, Server, FolderOpen, Settings } from "lucide-react";
+import { fetchServerList, getAllServersRuntimeStats, ServerRuntimeStats } from "@/services/docker/fetchs";
+import { getSystemStats, formatBytes, SystemStats } from "@/services/system/system.service";
+import { useLanguage } from "@/lib/hooks/useLanguage";
+import { usePolling } from "@/lib/hooks/usePolling";
+import { ServerQuickView } from "@/components/dashboard/ServerQuickView";
+import { SystemAlerts } from "@/components/dashboard/SystemAlerts";
+import { getSessionUser } from "@/services/auth/auth.service";
+import { PageTitle } from "@/components/molecules/PageTitle";
+
+type ServerInfo = {
+  id: string;
+  serverName?: string;
+};
+
+export default function HomePage() {
+  const { t } = useLanguage();
+  const [servers, setServers] = useState<ServerInfo[]>([]);
+  // One runtime-stats poll feeds the counters, the alerts and the overview.
+  const [resources, setResources] = useState<Record<string, ServerRuntimeStats> | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [username, setUsername] = useState("");
+  const [systemStats, setSystemStats] = useState<SystemStats | null>(null);
+
+  useEffect(() => {
+    getSessionUser()
+      .then((user) => setUsername(user.username))
+      .catch((error) => {
+        console.error("Error loading session user:", error);
+      });
+  }, []);
+
+  const loadResources = useCallback(() => {
+    getAllServersRuntimeStats()
+      .then(setResources)
+      .catch((error) => console.error("Error updating server resources:", error));
+  }, []);
+
+  const loadSystemStats = useCallback(() => {
+    getSystemStats()
+      .then(setSystemStats)
+      .catch((error) => console.error("Error updating system stats:", error));
+  }, []);
+
+  useEffect(() => {
+    fetchServerList()
+      .then(setServers)
+      .catch((error) => console.error("Error fetching servers:", error))
+      .finally(() => setIsLoading(false));
+    loadResources();
+    loadSystemStats();
+  }, [loadResources, loadSystemStats]);
+
+  usePolling(loadResources, servers.length > 0 ? 15000 : null);
+  usePolling(loadSystemStats, 30000);
+
+  const statusOf = (id: string) => resources?.[id]?.status ?? "not_found";
+  const runningServers = resources ? servers.filter((s) => statusOf(s.id) === "running").length : null;
+  const stoppedServers = resources ? servers.filter((s) => statusOf(s.id) === "stopped" || statusOf(s.id) === "not_found").length : null;
+
+  // Stat slots rendered as inventory item stacks
+  const statSlots = [
+    {
+      title: t("totalServers"),
+      value: servers.length,
+      img: "/images/command-block.webp",
+      countColor: "text-cyan-300",
+      active: false,
+    },
+    {
+      title: t("runningServers"),
+      value: runningServers,
+      img: "/images/emerald.webp",
+      countColor: "text-emerald-300",
+      active: (runningServers ?? 0) > 0,
+    },
+    {
+      title: t("stoppedServers"),
+      value: stoppedServers,
+      img: "/images/barrier.webp",
+      countColor: "text-red-300",
+      active: false,
+    },
+  ];
+
+  const resourceBars = systemStats
+    ? [
+        {
+          label: "CPU",
+          img: "/images/diamond.webp",
+          icon: Cpu,
+          color: "var(--mc-diamond)",
+          text: "text-cyan-300",
+          percent: systemStats.cpu.usage,
+          value: `${Math.round(systemStats.cpu.usage)}%`,
+        },
+        {
+          label: "RAM",
+          img: "/images/emerald.webp",
+          icon: Activity,
+          color: "#9dff3f",
+          text: "text-emerald-300",
+          percent: systemStats.memory.usagePercentage,
+          value: `${formatBytes(systemStats.memory.used)} / ${formatBytes(systemStats.memory.total)}`,
+        },
+        {
+          label: "DISK",
+          img: "/images/gold.webp",
+          icon: HardDrive,
+          color: "#f5c542",
+          text: "text-amber-300",
+          percent: systemStats.disk.usagePercentage,
+          value: `${formatBytes(systemStats.disk.used)} / ${formatBytes(systemStats.disk.total)}`,
+        },
+      ]
+    : [];
+
+  const quickActions = [
+    { href: "/dashboard/servers", img: "/images/crafting-table.webp", icon: Plus, label: t("createServer"), btn: "mc-btn-emerald" },
+    { href: "/dashboard/servers", img: "/images/command-block.webp", icon: Server, label: t("viewAllServers"), btn: "" },
+    { href: "/dashboard/files", img: "/images/chest.webp", icon: FolderOpen, label: t("files"), btn: "" },
+    { href: "/dashboard/settings", img: "/images/redstone.webp", icon: Settings, label: t("settings"), btn: "" },
+  ];
+
+  return (
+    <div className="space-y-6">
+      {/* Inventory window header */}
+      <div className="mc-panel animate-fade-in-up">
+        <div className="mc-titlebar px-4 py-2">
+          <PageTitle
+            icon="/images/grass.webp"
+            title={t("homeTitle")}
+            description={
+              <>
+                {t("welcomeBack")}, <span className="text-emerald-400 font-semibold">{username || t("admin")}</span>
+              </>
+            }
+          />
+        </div>
+
+        {/* Stat hotbar */}
+        <div className="flex flex-wrap items-stretch gap-3 p-4">
+          {statSlots.map((slot) => (
+            <div key={slot.title} className="flex items-center gap-3">
+              <div className={`mc-slot ${slot.active ? "mc-slot--active animate-slot-glint" : ""} relative w-16 h-16 flex items-center justify-center`}>
+                <Image src={slot.img} alt={slot.title} width={36} height={36} className="pixelated" />
+                <span className={`mc-count ${slot.countColor} absolute bottom-0.5 right-1 text-lg`}>{isLoading || slot.value === null ? "…" : slot.value}</span>
+              </div>
+              <span className="font-minecraft text-xs uppercase tracking-wider text-gray-400 max-w-[5.5rem] leading-tight">{slot.title}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {servers.length > 0 && resources && <SystemAlerts servers={servers} resources={resources} />}
+
+      {/* System + Quick actions */}
+      <div className="grid gap-6 lg:grid-cols-2 animate-fade-in-up stagger-2">
+        {/* System Health */}
+        <div className="mc-panel">
+          <div className="mc-titlebar flex items-center justify-between px-4 py-2.5">
+            <span className="font-minecraft text-sm text-white flex items-center gap-2">
+              <Cpu className="w-4 h-4 text-cyan-300" />
+              {t("systemHealth")}
+            </span>
+            <span className="mc-tag bg-emerald-700/70 text-emerald-200 text-xs px-2 py-0.5 flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 bg-emerald-300 rounded-full animate-pulse" />
+              {t("healthy")}
+            </span>
+          </div>
+          <div className="p-4 space-y-4">
+            {systemStats ? (
+              resourceBars.map((bar) => (
+                <div key={bar.label} className="space-y-1.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="flex items-center gap-2 font-minecraft text-gray-300">
+                      <Image src={bar.img} alt={bar.label} width={18} height={18} className="pixelated" />
+                      {bar.label}
+                    </span>
+                    <span className={`font-mono ${bar.text}`}>{bar.value}</span>
+                  </div>
+                  <div className="mc-bar">
+                    <div className="mc-bar__fill" style={{ width: `${Math.min(bar.percent, 100)}%`, backgroundColor: bar.color }} />
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="flex items-center justify-center py-6">
+                <div className="text-gray-400 text-sm font-minecraft">{t("loading")}</div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Quick Actions */}
+        <div className="mc-panel">
+          <div className="mc-titlebar flex items-center px-4 py-2.5">
+            <span className="font-minecraft text-sm text-white flex items-center gap-2">
+              <Image src="/images/crafting-table.webp" alt="" width={18} height={18} className="pixelated" />
+              {t("quickActions")}
+            </span>
+          </div>
+          <div className="p-4 grid grid-cols-2 gap-3">
+            {quickActions.map((action) => (
+              <Link key={action.label} href={action.href}>
+                <button className={`mc-btn ${action.btn} w-full h-full py-4 flex-col gap-2`}>
+                  <Image src={action.img} alt="" width={32} height={32} className="pixelated" />
+                  <span className="text-sm leading-tight text-center px-1">{action.label}</span>
+                </button>
+              </Link>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Servers Overview */}
+      {servers.length > 0 && (
+        <div className="animate-fade-in-up stagger-3">
+          <ServerQuickView servers={servers} resources={resources} />
+        </div>
+      )}
+
+      {/* Empty State */}
+      {servers.length === 0 && !isLoading && (
+        <div className="mc-panel">
+          <div className="flex flex-col items-center justify-center py-12 px-6 text-center">
+            <Image src="/images/chest.webp" alt="Empty" width={64} height={64} className="pixelated opacity-70 mb-4 animate-float" />
+            <h3 className="text-lg font-minecraft text-gray-200 mb-2">{t("noServersAvailable")}</h3>
+            <p className="text-gray-400 text-sm mb-5">{t("noServersAvailableDesc")}</p>
+            <Link href="/dashboard/servers">
+              <button className="mc-btn mc-btn-emerald px-6 py-3">
+                <Plus className="w-4 h-4" />
+                {t("createFirstServer")}
+              </button>
+            </Link>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}

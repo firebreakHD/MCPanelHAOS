@@ -1,0 +1,16 @@
+import { NotificationsModule } from 'src/notifications/notifications.module';
+import { Module } from '@nestjs/common';
+import { DockerComposeModule } from 'src/docker-compose/docker-compose.module';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { ScheduledTask } from './entities/scheduled-task.entity';
+import { ScheduledTasksController } from './scheduled-tasks.controller';
+import { ScheduledTasksService } from './scheduled-tasks.service';
+import { ServerManagementModule } from 'src/server-management/server-management.module';
+import { UsersModule } from 'src/users/users.module';
+
+@Module({
+  imports: [DockerComposeModule, TypeOrmModule.forFeature([ScheduledTask]), ServerManagementModule, UsersModule, NotificationsModule],
+  controllers: [ScheduledTasksController],
+  providers: [ScheduledTasksService],
+})
+export class ScheduledTasksModule {}

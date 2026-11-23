@@ -1,0 +1,834 @@
+'use client';
+
+import { useEffect, useState, useCallback } from 'react';
+import Image from 'next/image';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import {
+  Plus,
+  Loader2,
+  Trash2,
+  ChevronRight,
+  Zap,
+  LayoutTemplate,
+  Check,
+  Coffee,
+  Smartphone,
+  Copy,
+  Star,
+  Play,
+  Square,
+} from 'lucide-react';
+import {
+  fetchServerList,
+  createServer,
+  getAllServersStatus,
+  deleteServer,
+  cloneServer,
+  startServer,
+  stopServer,
+} from '@/services/docker/fetchs';
+import { mcToast } from '@/lib/utils/minecraft-toast';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import {
+  Form,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form';
+import { useForm } from 'react-hook-form';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
+import Link from 'next/link';
+import { useLanguage } from '@/lib/hooks/useLanguage';
+import { getStatusBadgeClass, getStatusColor, getStatusIcon } from '@/lib/utils/server-status';
+import { usePolling } from '@/lib/hooks/usePolling';
+import { favoritesFirst, useFavoritesStore } from '@/lib/store/favorites-store';
+import { getTemplatesByEdition, ServerTemplate } from '@/lib/server-templates';
+import { ServerEdition } from '@/lib/types/types';
+import { TranslationKey } from '@/lib/translations';
+import { getCurrentUser } from '@/services/users/users.service';
+import { getProxyMappings, getProxyStatus } from '@/services/network.service';
+import { PageTitle } from '@/components/molecules/PageTitle';
+
+type ServerInfo = {
+  id: string;
+  name: string;
+  description: string;
+  displayName: string;
+  status: 'running' | 'stopped' | 'starting' | 'not_found' | 'loading';
+  port: string;
+  containerName: string;
+};
+
+export default function Dashboard() {
+  const { t } = useLanguage();
+  const [servers, setServers] = useState<ServerInfo[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isCreatingServer, setIsCreatingServer] = useState(false);
+  const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const [isDeletingServer, setIsDeletingServer] = useState<string | null>(null);
+  const [cloneSource, setCloneSource] = useState<string | null>(null);
+  const [cloneNewId, setCloneNewId] = useState('');
+  const [isCloning, setIsCloning] = useState(false);
+  const [createMode, setCreateMode] = useState<'quick' | 'template'>('quick');
+  const [selectedTemplate, setSelectedTemplate] = useState<ServerTemplate | null>(null);
+  const [selectedEdition, setSelectedEdition] = useState<ServerEdition>('JAVA');
+  const [canCreateServers, setCanCreateServers] = useState(false);
+  const [proxyAddresses, setProxyAddresses] = useState<Record<string, string>>({});
+  const favorites = useFavoritesStore((state) => state.ids);
+  const toggleFavorite = useFavoritesStore((state) => state.toggle);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const availableTemplates = getTemplatesByEdition(selectedEdition);
+
+  const form = useForm<{ id: string }>({
+    defaultValues: {
+      id: '',
+    },
+  });
+
+  useEffect(() => {
+    getCurrentUser()
+      .then((user) => setCanCreateServers(user.role === 'ADMIN' || user.access.permissions.accessAllServers))
+      .catch(() => setCanCreateServers(false));
+    fetchServersFromBackend();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Proxied servers publish no host port, so the allocated one is not reachable:
+  // what players use is the router hostname.
+  const loadProxyAddresses = useCallback(async () => {
+    const status = await getProxyStatus();
+    if (!status.enabled) {
+      setProxyAddresses({});
+      return;
+    }
+
+    const mappings = await getProxyMappings();
+    const port = status.proxyPort && status.proxyPort !== '25565' ? `:${status.proxyPort}` : '';
+    setProxyAddresses(
+      Object.fromEntries(
+        mappings.map(({ host, backend }) => [backend.split(':')[0], `${host}${port}`]),
+      ),
+    );
+  }, []);
+
+  const fetchServersFromBackend = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const [serverList, statuses] = await Promise.all([
+        fetchServerList(),
+        getAllServersStatus().catch((error) => {
+          console.error('Error processing server statuses:', error);
+          mcToast.error(t('errorProcessingStatuses'));
+          return {} as Record<string, ServerInfo['status']>;
+        }),
+        loadProxyAddresses().catch((error) => console.error('Error loading proxy addresses:', error)),
+      ]);
+      const formattedServers: ServerInfo[] = serverList.map((server) => ({
+        id: server.id,
+        name: server.serverName || `${t('serverDefaultName')} ${server.id}`,
+        description: server.motd || t('minecraftServer'),
+        displayName: server.serverName || `minecraft-${server.id}`,
+        status: statuses[server.id] || 'not_found',
+        port: server.port || '25565',
+        containerName: `${server.id}`,
+      }));
+
+      const ids = new Set(formattedServers.map((s) => s.id));
+      setSelected((current) => current.filter((id) => ids.has(id)));
+      setServers(formattedServers);
+    } catch (error) {
+      console.error('Error fetching server list:', error);
+      mcToast.error(t('errorLoadingServerList'));
+    } finally {
+      setIsLoading(false);
+    }
+  }, [t, loadProxyAddresses]);
+
+  const toggleSelected = (id: string) =>
+    setSelected((current) => (current.includes(id) ? current.filter((x) => x !== id) : [...current, id]));
+
+  // One at a time: each start or stop runs docker compose, and a burst would starve the host.
+  const runBulk = async (action: 'start' | 'stop') => {
+    const targets = servers.filter(
+      (s) =>
+        selected.includes(s.id) &&
+        (action === 'start' ? s.status === 'stopped' : s.status === 'running' || s.status === 'starting'),
+    );
+    if (targets.length === 0) return;
+    setBulkBusy(true);
+    const failed: string[] = [];
+    for (const target of targets) {
+      const result = await (action === 'start' ? startServer : stopServer)(target.id);
+      if (!result.success) failed.push(target.id);
+    }
+    setBulkBusy(false);
+    setSelected([]);
+    mcToast[failed.length ? 'error' : 'success'](
+      failed.length ? `${t('bulkFailed')}: ${failed.join(', ')}` : `${t('bulkDone')}: ${targets.length}`,
+    );
+    await fetchServersFromBackend();
+  };
+
+
+  const handleDeleteServer = async (serverId: string) => {
+    setIsDeletingServer(serverId);
+    try {
+      const response = await deleteServer(serverId);
+      if (response.success) {
+        mcToast.success(`${t('serverDeletedSuccess')} "${serverId}"`);
+        await fetchServersFromBackend();
+      } else {
+        mcToast.error(`${t('errorDeletingServer')}: ${response.message}`);
+      }
+    } catch (error) {
+      console.error('Error deleting server:', error);
+      const err = error as { response?: { data?: { message?: string } } };
+      mcToast.error(err.response?.data?.message || t('errorDeletingServer'));
+    } finally {
+      setIsDeletingServer(null);
+    }
+  };
+
+  const handleCloneServer = async () => {
+    if (!cloneSource || !cloneNewId.trim()) return;
+    setIsCloning(true);
+    try {
+      const response = await cloneServer(cloneSource, cloneNewId.trim());
+      if (response.success) {
+        mcToast.success(`${t('serverClonedSuccess')} "${cloneNewId.trim()}"`);
+        setCloneSource(null);
+        setCloneNewId('');
+        await fetchServersFromBackend();
+      } else {
+        mcToast.error(`${t('errorCloningServer')}: ${response.message}`);
+      }
+    } catch (error) {
+      console.error('Error cloning server:', error);
+      const err = error as { response?: { data?: { message?: string } } };
+      mcToast.error(err.response?.data?.message || t('errorCloningServer'));
+    } finally {
+      setIsCloning(false);
+    }
+  };
+
+  // Functional update: the polling callback must not read a list captured on mount.
+  const loadServerInfo = useCallback(async () => {
+    try {
+      const statuses = await getAllServersStatus();
+      setServers((current) => current.map((server) => ({ ...server, status: statuses[server.id] || 'not_found' })));
+    } catch (error) {
+      console.error('Error loading server information:', error);
+    }
+  }, []);
+
+  usePolling(loadServerInfo, servers.length > 0 ? 30000 : null);
+
+  const handleCreateServer = async (values: { id: string }) => {
+    setIsCreatingServer(true);
+    try {
+      const baseConfig = {
+        id: values.id,
+        edition: selectedEdition,
+        port: selectedEdition === 'BEDROCK' ? '19132' : '25565',
+        enableRcon: selectedEdition !== 'BEDROCK',
+        minecraftVersion: selectedEdition === 'BEDROCK' ? 'LATEST' : 'latest',
+      };
+      const serverData = selectedTemplate
+        ? { ...baseConfig, ...selectedTemplate.config }
+        : baseConfig;
+      const response = await createServer(serverData);
+      if (response.success) {
+        mcToast.success(`${t('serverCreatedSuccess')} "${values.id}"`);
+        setIsDialogOpen(false);
+        form.reset();
+        setSelectedTemplate(null);
+        setCreateMode('quick');
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await fetchServersFromBackend();
+      } else {
+        mcToast.error(`${t('errorCreatingServer')}: ${response.message}`);
+      }
+    } catch (error) {
+      console.error('Error creating server:', error);
+      const err = error as { response?: { data?: { message?: string } } };
+      mcToast.error(err.response?.data?.message || t('errorCreatingServer'));
+    } finally {
+      setIsCreatingServer(false);
+    }
+  };
+
+  const getStatusText = (status: string) => {
+    switch (status) {
+      case 'running':
+        return t('active');
+      case 'starting':
+        return t('starting2');
+      case 'stopped':
+        return t('stopped2');
+      case 'not_found':
+        return t('notFound');
+      case 'loading':
+        return t('loading');
+      default:
+        return t('unknown');
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="mc-panel animate-fade-in-up">
+        <div className="mc-titlebar flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 py-2">
+          <PageTitle icon="/images/command-block.webp" title={t('dashboardTitle')} description={t('dashboardDescription')} />
+
+          <Dialog
+            open={isDialogOpen}
+            onOpenChange={(open) => {
+              setIsDialogOpen(open);
+              if (!open) {
+                setSelectedTemplate(null);
+                setCreateMode('quick');
+                setSelectedEdition('JAVA');
+              }
+            }}
+          >
+            {canCreateServers ? (
+              <DialogTrigger asChild>
+                <button className="mc-btn mc-btn-emerald px-4 py-2 text-sm self-start">
+                  <Plus className="h-4 w-4" />
+                  {t('createServer')}
+                </button>
+              </DialogTrigger>
+            ) : null}
+            <DialogContent className="sm:max-w-150 bg-gray-900 border-gray-700 text-white max-h-[85vh] overflow-hidden flex flex-col">
+              <DialogHeader>
+                <DialogTitle className="font-minecraft">{t('createNewServer')}</DialogTitle>
+                <DialogDescription className="text-gray-400">
+                  {t('chooseCreationMethod')}
+                </DialogDescription>
+              </DialogHeader>
+
+              {/* Tabs */}
+              <div className="flex gap-2 border-b border-gray-700 pb-2">
+                <Button
+                  type="button"
+                  variant={createMode === 'quick' ? 'default' : 'ghost'}
+                  size="sm"
+                  onClick={() => {
+                    setCreateMode('quick');
+                    setSelectedTemplate(null);
+                  }}
+                  className={
+                    createMode === 'quick'
+                      ? 'bg-[var(--mc-emerald)]/15 text-[var(--mc-emerald)] hover:bg-[var(--mc-emerald)]/20'
+                      : 'text-gray-400 hover:text-white hover:bg-gray-700/50'
+                  }
+                >
+                  <Zap className="h-4 w-4 mr-1" /> {t('quickCreate')}
+                </Button>
+                <Button
+                  type="button"
+                  variant={createMode === 'template' ? 'default' : 'ghost'}
+                  size="sm"
+                  onClick={() => setCreateMode('template')}
+                  className={
+                    createMode === 'template'
+                      ? 'bg-[var(--mc-emerald)]/15 text-[var(--mc-emerald)] hover:bg-[var(--mc-emerald)]/20'
+                      : 'text-gray-400 hover:text-white hover:bg-gray-700/50'
+                  }
+                >
+                  <LayoutTemplate className="h-4 w-4 mr-1" /> {t('fromTemplate')}
+                </Button>
+              </div>
+
+              <Form {...form}>
+                <form
+                  onSubmit={form.handleSubmit(handleCreateServer)}
+                  className="space-y-4 flex-1 overflow-hidden flex flex-col"
+                >
+                  {createMode === 'template' && (
+                    <div className="flex-1 overflow-y-auto pr-2 space-y-2">
+                      <p className="text-sm text-gray-400 mb-2">{t('selectTemplate')}</p>
+                      <div className="grid grid-cols-2 gap-2">
+                        {availableTemplates.map((template) => (
+                          <button
+                            key={template.id}
+                            type="button"
+                            onClick={() => setSelectedTemplate(template)}
+                            className={`p-3 rounded-lg border text-left transition-all ${selectedTemplate?.id === template.id ? 'border-emerald-500 bg-emerald-900/30' : 'border-gray-700 bg-gray-800/50 hover:border-gray-600'}`}
+                          >
+                            <div className="flex items-start gap-2">
+                              <Image
+                                src={`/images/${template.icon}.webp`}
+                                alt={template.name}
+                                width={24}
+                                height={24}
+                                className="mt-0.5"
+                              />
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-minecraft text-sm text-white">
+                                    {t(template.name as TranslationKey)}
+                                  </span>
+                                  {selectedTemplate?.id === template.id && (
+                                    <Check className="h-4 w-4 text-emerald-400" />
+                                  )}
+                                </div>
+                                <p className="text-xs text-gray-400 mt-0.5 line-clamp-2">
+                                  {t(template.description as TranslationKey)}
+                                </p>
+                                <div className="flex gap-1 mt-1">
+                                  <Badge
+                                    variant="outline"
+                                    className="text-[10px] px-1 py-0 border-gray-600 text-gray-300 bg-gray-800/50"
+                                  >
+                                    {template.config.serverType}
+                                  </Badge>
+                                  <Badge
+                                    variant="outline"
+                                    className="text-[10px] px-1 py-0 border-gray-600 text-gray-300 bg-gray-800/50"
+                                  >
+                                    {template.config.gameMode}
+                                  </Badge>
+                                </div>
+                              </div>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {createMode === 'quick' && (
+                    <p className="text-sm text-gray-400">{t('quickCreateDesc')}</p>
+                  )}
+
+                  {/* Edition Selector */}
+                  <div className="space-y-2">
+                    <p className="text-sm font-medium text-gray-200">{t('serverEdition')}</p>
+                    <div className="grid grid-cols-2 gap-3">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedEdition('JAVA');
+                          setSelectedTemplate(null);
+                        }}
+                        className={`flex items-center gap-3 p-3 rounded-lg border transition-all ${
+                          selectedEdition === 'JAVA'
+                            ? 'border-emerald-500 bg-emerald-900/30'
+                            : 'border-gray-700 bg-gray-800/50 hover:border-gray-600'
+                        }`}
+                      >
+                        <Coffee className="h-5 w-5 text-orange-400" />
+                        <div className="text-left">
+                          <span className="text-sm font-minecraft text-white">Java Edition</span>
+                          <p className="text-xs text-gray-400">{t('javaEditionDesc')}</p>
+                        </div>
+                        {selectedEdition === 'JAVA' && (
+                          <Check className="h-4 w-4 text-emerald-400 ml-auto" />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedEdition('BEDROCK');
+                          setSelectedTemplate(null);
+                        }}
+                        className={`flex items-center gap-3 p-3 rounded-lg border transition-all ${
+                          selectedEdition === 'BEDROCK'
+                            ? 'border-emerald-500 bg-emerald-900/30'
+                            : 'border-gray-700 bg-gray-800/50 hover:border-gray-600'
+                        }`}
+                      >
+                        <Smartphone className="h-5 w-5 text-green-400" />
+                        <div className="text-left">
+                          <span className="text-sm font-minecraft text-white">Bedrock</span>
+                          <p className="text-xs text-gray-400">{t('bedrockEditionDesc')}</p>
+                        </div>
+                        {selectedEdition === 'BEDROCK' && (
+                          <Check className="h-4 w-4 text-emerald-400 ml-auto" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  <FormField
+                    control={form.control}
+                    name="id"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-gray-200">{t('serverIdLabel')}</FormLabel>
+                        <FormControl>
+                          <Input
+                            placeholder={t('serverIdPlaceholder')}
+                            {...field}
+                            className="bg-gray-800 border-gray-700 text-white"
+                          />
+                        </FormControl>
+                        <FormDescription className="text-gray-400">
+                          {t('serverIdDescription')}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  {selectedTemplate && (
+                    <div className="p-3 bg-emerald-900/20 border border-emerald-700/30 rounded-lg">
+                      <p className="text-sm text-emerald-400 font-minecraft">
+                        {t('templateSelected')}: {t(selectedTemplate.name as TranslationKey)}
+                      </p>
+                      <p className="text-xs text-gray-400 mt-1">
+                        {t(selectedTemplate.description as TranslationKey)}
+                      </p>
+                    </div>
+                  )}
+
+                  <DialogFooter className="gap-3 sm:gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setIsDialogOpen(false)}
+                      className="mc-btn px-4 py-2.5"
+                    >
+                      {t('cancel')}
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={
+                        isCreatingServer || (createMode === 'template' && !selectedTemplate)
+                      }
+                      className="mc-btn mc-btn-emerald px-4 py-2.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {isCreatingServer ? (
+                        <>
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          {t('creating')}
+                        </>
+                      ) : (
+                        t('createServer')
+                      )}
+                    </button>
+                  </DialogFooter>
+                </form>
+              </Form>
+            </DialogContent>
+          </Dialog>
+        </div>
+      </div>
+
+      <div>
+        {servers.length === 0 && !isLoading ? (
+          <div className="mc-panel text-center py-16 px-6 animate-fade-in">
+            <Image
+              src="/images/chest.webp"
+              alt="Empty chest"
+              width={80}
+              height={80}
+              className="pixelated mx-auto mb-6 opacity-70 animate-float"
+            />
+            <h3 className="text-2xl font-minecraft text-gray-200 mb-4">
+              {t('noServersAvailable')}
+            </h3>
+            <p className="text-gray-400 mb-8 text-lg">{t('noServersAvailableDesc')}</p>
+            <button
+              onClick={() => setIsDialogOpen(true)}
+              className="mc-btn mc-btn-emerald text-lg px-8 py-3 mx-auto"
+            >
+              <Plus className="h-5 w-5" />
+              {t('createFirstServer')}
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2.5">
+            <div className="mc-panel flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-2 text-sm text-gray-300">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="size-4 accent-emerald-500"
+                  checked={selected.length > 0 && selected.length === servers.length}
+                  onChange={(e) => setSelected(e.target.checked ? servers.map((s) => s.id) : [])}
+                />
+                {t('bulkSelectAll')}
+              </label>
+              {selected.length > 0 && (
+                <>
+                  <span className="font-minecraft text-xs text-gray-400">
+                    {selected.length} {t('bulkSelected')}
+                  </span>
+                  <button className="mc-btn mc-btn-emerald px-3 py-1 text-xs" disabled={bulkBusy} onClick={() => runBulk('start')}>
+                    {bulkBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+                    {t('bulkStart')}
+                  </button>
+                  <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                      <button className="mc-btn px-3 py-1 text-xs" disabled={bulkBusy}>
+                        <Square className="h-3.5 w-3.5" />
+                        {t('bulkStop')}
+                      </button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent className="bg-gray-900 border-gray-700 text-white">
+                      <AlertDialogHeader>
+                        <AlertDialogTitle className="font-minecraft">
+                          {t('bulkStop')} ({selected.length})
+                        </AlertDialogTitle>
+                        <AlertDialogDescription className="text-gray-400">{t('bulkStopConfirm')}</AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel className="bg-gray-700 hover:bg-gray-600">{t('cancel')}</AlertDialogCancel>
+                        <AlertDialogAction onClick={() => runBulk('stop')}>{t('bulkStop')}</AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+                  <button className="text-xs text-gray-400 underline hover:text-white" disabled={bulkBusy} onClick={() => setSelected([])}>
+                    {t('bulkClear')}
+                  </button>
+                </>
+              )}
+            </div>
+            {favoritesFirst(servers, favorites).map((server: ServerInfo, index: number) => (
+              <div
+                key={server.id}
+                className={`animate-fade-in-up stagger-${Math.min(index + 1, 6)}`}
+              >
+                <div className="mc-panel group overflow-hidden transition-[transform,box-shadow] duration-200 hover:-translate-y-0.5 hover:shadow-[inset_3px_3px_0_rgba(255,255,255,0.1),inset_-3px_-3px_0_rgba(0,0,0,0.5),6px_6px_0_rgba(157,255,63,0.28)] focus-within:shadow-[inset_3px_3px_0_rgba(255,255,255,0.1),inset_-3px_-3px_0_rgba(0,0,0,0.5),6px_6px_0_rgba(157,255,63,0.28)]">
+                  {/* Single direct child: `.mc-panel > *` forces position/z-index,
+                      which would break the stretched link if applied to it. */}
+                  <div className="flex items-stretch">
+                    <div className={`w-1.5 shrink-0 ${getStatusColor(server.status)}`}></div>
+
+                    <Link
+                      href={`/dashboard/servers/${server.id}`}
+                      aria-label={`${t('configure')} ${server.id}`}
+                      className="absolute inset-0 z-10 focus:outline-none"
+                    />
+
+                    <div className="flex flex-1 min-w-0 flex-wrap sm:flex-nowrap items-center gap-x-4 gap-y-2 px-3 py-2.5 sm:px-4">
+                      <div className="flex items-center gap-3 min-w-0 flex-1 basis-56">
+                        <div className="mc-slot relative w-10 h-10 flex items-center justify-center shrink-0">
+                          <Image
+                            src={getStatusIcon(server.status)}
+                            alt="Server Status"
+                            width={26}
+                            height={26}
+                            className="pixelated object-contain"
+                          />
+                        </div>
+                        <div className="min-w-0">
+                          <p
+                            className="text-white font-minecraft text-sm leading-tight group-hover:text-emerald-400 transition-colors truncate"
+                            title={server.id}
+                          >
+                            {server.id}
+                          </p>
+                          <p className="text-gray-400 text-xs truncate">{server.description}</p>
+                        </div>
+                      </div>
+
+                      <div className="hidden md:block shrink-0 text-right leading-tight font-mono text-xs">
+                        {proxyAddresses[server.id] ? (
+                          <p
+                            className="text-gray-300 truncate max-w-40"
+                            title={t('serverConnection')}
+                          >
+                            {proxyAddresses[server.id]}
+                          </p>
+                        ) : (
+                          <p className="text-gray-300" title={t('port')}>
+                            :{server.port}
+                          </p>
+                        )}
+                        <p className="text-gray-500 truncate max-w-40" title={t('container')}>
+                          {server.containerName}
+                        </p>
+                      </div>
+
+                      <Badge
+                        variant="outline"
+                        className={`px-2 py-0.5 text-[11px] shrink-0 ${getStatusBadgeClass(server.status)}`}
+                      >
+                        {server.status === 'loading' || server.status === 'starting' ? (
+                          <span className="flex items-center gap-1.5">
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                            {getStatusText(server.status)}
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1.5">
+                            <div className="w-1.5 h-1.5 rounded-full bg-current"></div>
+                            {getStatusText(server.status)}
+                          </span>
+                        )}
+                      </Badge>
+
+                      <div className="relative z-20 flex items-center gap-0.5 shrink-0 ml-auto">
+                        <input
+                          type="checkbox"
+                          className="mx-2 size-4 accent-emerald-500"
+                          aria-label={`${t('bulkSelect')} ${server.id}`}
+                          checked={selected.includes(server.id)}
+                          onChange={() => toggleSelected(server.id)}
+                        />
+                        <button
+                          className="mc-iconbtn"
+                          title={favorites.includes(server.id) ? t('favoriteRemove') : t('favoriteAdd')}
+                          aria-label={favorites.includes(server.id) ? t('favoriteRemove') : t('favoriteAdd')}
+                          aria-pressed={favorites.includes(server.id)}
+                          onClick={() => toggleFavorite(server.id)}
+                        >
+                          <Star className={`h-4 w-4 ${favorites.includes(server.id) ? 'fill-yellow-400 text-yellow-400' : ''}`} />
+                        </button>
+                        {canCreateServers && (
+                          <button
+                            className="mc-iconbtn"
+                            title={t('cloneServer')}
+                            aria-label={t('cloneServer')}
+                            onClick={() => {
+                              setCloneNewId(`${server.id}-copy`);
+                              setCloneSource(server.id);
+                            }}
+                          >
+                            <Copy className="h-4 w-4" />
+                          </button>
+                        )}
+
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <button
+                              className="mc-iconbtn mc-iconbtn--danger"
+                              title={t('delete')}
+                              aria-label={t('delete')}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent className="bg-gray-900 border-gray-700 text-white">
+                            <AlertDialogHeader>
+                              <AlertDialogTitle className="font-minecraft">
+                                {t('deleteServerTitle')}
+                              </AlertDialogTitle>
+                              <AlertDialogDescription className="text-gray-400">
+                                {t('deleteServerWarning')} &quot;{server.id}&quot;?
+                                <br />
+                                {t('cannotBeUndone')}
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel className="bg-gray-700 hover:bg-gray-600">
+                                {t('cancel')}
+                              </AlertDialogCancel>
+                              <AlertDialogAction
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  handleDeleteServer(server.id);
+                                }}
+                                className="bg-red-600 hover:bg-red-700 text-white"
+                                disabled={isDeletingServer === server.id}
+                              >
+                                {isDeletingServer === server.id ? (
+                                  <>
+                                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                    {t('eliminating')}
+                                  </>
+                                ) : (
+                                  t('delete')
+                                )}
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      </div>
+
+                      <ChevronRight
+                        className="hidden sm:block h-4 w-4 shrink-0 text-gray-600 transition-all duration-200 group-hover:translate-x-0.5 group-hover:text-emerald-400"
+                        aria-hidden="true"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <Dialog
+        open={cloneSource !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setCloneSource(null);
+            setCloneNewId('');
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-105 bg-gray-900 border-gray-700 text-white">
+          <DialogHeader>
+            <DialogTitle className="font-minecraft">{t('cloneServer')}</DialogTitle>
+            <DialogDescription className="text-gray-400">
+              {t('cloneServerDesc')} &quot;{cloneSource}&quot;. {t('cloneServerNote')}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <p className="text-sm text-gray-200">{t('serverIdLabel')}</p>
+            <Input
+              value={cloneNewId}
+              onChange={(e) => setCloneNewId(e.target.value)}
+              placeholder={t('serverIdPlaceholder')}
+              className="bg-gray-800 border-gray-700 text-white"
+            />
+            {cloneNewId.trim() !== '' && !/^[a-zA-Z0-9_-]+$/.test(cloneNewId.trim()) && (
+              <p className="text-xs text-amber-400">{t('serverIdDescription')}</p>
+            )}
+          </div>
+          <DialogFooter className="gap-3 sm:gap-2 pt-2">
+            <button
+              type="button"
+              onClick={() => setCloneSource(null)}
+              className="mc-btn px-4 py-2.5"
+            >
+              {t('cancel')}
+            </button>
+            <button
+              type="button"
+              onClick={handleCloneServer}
+              disabled={
+                isCloning || cloneNewId.trim() === '' || !/^[a-zA-Z0-9_-]+$/.test(cloneNewId.trim())
+              }
+              className="mc-btn mc-btn-emerald px-4 py-2.5 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isCloning ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {t('cloning')}
+                </>
+              ) : (
+                t('cloneServer')
+              )}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

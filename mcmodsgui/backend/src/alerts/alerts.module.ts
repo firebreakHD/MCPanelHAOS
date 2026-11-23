@@ -1,0 +1,17 @@
+import { Module } from '@nestjs/common';
+import { DockerComposeModule } from 'src/docker-compose/docker-compose.module';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { AlertConfig } from './entities/alert-config.entity';
+import { AlertsController } from './alerts.controller';
+import { AlertsService } from './alerts.service';
+import { Settings } from 'src/users/entities/settings.entity';
+import { NotificationsModule } from 'src/notifications/notifications.module';
+import { UsersModule } from 'src/users/users.module';
+
+@Module({
+  imports: [DockerComposeModule, TypeOrmModule.forFeature([AlertConfig, Settings]), NotificationsModule, UsersModule],
+  controllers: [AlertsController],
+  providers: [AlertsService],
+  exports: [AlertsService],
+})
+export class AlertsModule {}

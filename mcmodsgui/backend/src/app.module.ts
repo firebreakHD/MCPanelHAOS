@@ -1,0 +1,77 @@
+import { PlayerActivityModule } from './player-activity/player-activity.module';
+import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+import { ServerManagementModule } from './server-management/server-management.module';
+import { AuthModule } from './auth/auth.module';
+import { UsersModule } from './users/users.module';
+import { ConfigModule } from '@nestjs/config';
+import { ThrottlerModule, seconds } from '@nestjs/throttler';
+import config from 'src/config';
+import { DatabaseModule } from './database/database.module';
+import { SystemMonitoringModule } from './system-monitoring/system-monitoring.module';
+import { VersionModule } from './version/version.module';
+import { DiscordModule } from './discord/discord.module';
+import { CurseforgeModule } from './curseforge/curseforge.module';
+import { FilesModule } from './files/files.module';
+import { ProxyModule } from './proxy/proxy.module';
+import { ModrinthModule } from './modrinth/modrinth.module';
+import { VanillaTweaksModule } from './vanilla-tweaks/vanilla-tweaks.module';
+import { WorldDiscoveryModule } from './world-discovery/world-discovery.module';
+import { BedrockAddonsModule } from './bedrock-addons/bedrock-addons.module';
+import { ModpacksModule } from './modpacks/modpacks.module';
+import { MetricsModule } from './metrics/metrics.module';
+import { ScheduledTasksModule } from './scheduled-tasks/scheduled-tasks.module';
+import { AlertsModule } from './alerts/alerts.module';
+import { PlayersModule } from './players/players.module';
+import { ActivityModule } from './activity/activity.module';
+import { AchievementsModule } from './achievements/achievements.module';
+import { LogPresetsModule } from './log-presets/log-presets.module';
+import { EndRunsModule } from './end-runs/end-runs.module';
+import { McpModule } from './mcp/mcp.module';
+import { JwtAuthGuard } from './auth/guards/auth.guard';
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({
+      load: [config],
+      isGlobal: true,
+    }),
+    ThrottlerModule.forRoot([{ ttl: seconds(60), limit: 10 }]),
+    DatabaseModule,
+    UsersModule,
+    ServerManagementModule,
+    AuthModule,
+    SystemMonitoringModule,
+    VersionModule,
+    DiscordModule,
+    CurseforgeModule,
+    ModrinthModule,
+    VanillaTweaksModule,
+    WorldDiscoveryModule,
+    BedrockAddonsModule,
+    ModpacksModule,
+    MetricsModule,
+    PlayerActivityModule,
+    ScheduledTasksModule,
+    AlertsModule,
+    PlayersModule,
+    ActivityModule,
+    AchievementsModule,
+    LogPresetsModule,
+    EndRunsModule,
+    FilesModule,
+    ProxyModule,
+    McpModule,
+  ],
+  controllers: [AppController],
+  providers: [
+    AppService,
+    {
+      provide: APP_GUARD,
+      useClass: JwtAuthGuard,
+    },
+  ],
+})
+export class AppModule {}

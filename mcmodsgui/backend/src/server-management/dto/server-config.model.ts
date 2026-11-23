@@ -1,0 +1,847 @@
+import { IsString, IsOptional, IsBoolean, IsEnum, IsNotEmpty, IsObject, Matches, IsInt, IsNumber, Min, Max, IsArray, ValidateNested, MaxLength, ValidateBy, buildMessage, IsIn, ArrayMaxSize } from 'class-validator';
+import { Type } from 'class-transformer';
+import { isValidPortMapping } from 'src/common/compose/port-mapping';
+import { PartialType } from '@nestjs/mapped-types';
+import { COMPOSE_SNIPPET_TARGETS, type ComposeSnippetTarget } from 'src/common/compose/compose-snippets';
+
+// Built-in feature packs (data/minecraft/datapacks in the server jar), identical from 1.21.11 to 26.3.
+// Minecraft only reads INITIAL_ENABLED_PACKS when it creates the world.
+export const EXPERIMENTAL_PACKS = ['minecart_improvements', 'redstone_experiments', 'trade_rebalance'] as const;
+
+/** The packs of an INITIAL_ENABLED_PACKS value, or null when it names one the panel does not offer. */
+export function knownExperimentalPacks(value: string | undefined): string[] | null {
+  const packs = (value ?? '').split(',').map((pack) => pack.trim()).filter(Boolean);
+  return packs.every((pack) => (EXPERIMENTAL_PACKS as readonly string[]).includes(pack)) ? packs : null;
+}
+
+// Console commands itzg runs through RCON on server events (scripts/auto/rcon-cmds-daemon.sh).
+// They carry console power, so changing them needs the useConsole permission.
+export const EVENT_COMMAND_FIELDS = {
+  rconCmdsStartup: 'RCON_CMDS_STARTUP',
+  rconCmdsFirstConnect: 'RCON_CMDS_FIRST_CONNECT',
+  rconCmdsOnConnect: 'RCON_CMDS_ON_CONNECT',
+  rconCmdsOnDisconnect: 'RCON_CMDS_ON_DISCONNECT',
+  rconCmdsLastDisconnect: 'RCON_CMDS_LAST_DISCONNECT',
+} as const;
+export type EventCommandField = keyof typeof EVENT_COMMAND_FIELDS;
+/** One command per line, without blank lines or a leading slash; null when nothing is left. */
+export function normalizeEventCommands(text: string | undefined | null): string | null {
+  const commands = (text ?? '')
+    .split('\n')
+    .map((line) => line.trim().replace(/^\/+/, '').trim())
+    .filter(Boolean);
+  return commands.length > 0 ? commands.join('\n') : null;
+}
+
+export type ServerEdition = 'JAVA' | 'BEDROCK';
+
+// Seconds Docker must keep waiting after the stop announcement so Minecraft can flush its final save
+export const SHUTDOWN_BUFFER_SECONDS = 60;
+
+export class ComposeSnippetDto {
+  @IsEnum(COMPOSE_SNIPPET_TARGETS)
+  target: ComposeSnippetTarget;
+
+  @IsString()
+  @MaxLength(20000)
+  yaml: string;
+}
+
+export class ServerConfigDto {
+  @IsString()
+  @IsNotEmpty()
+  id: string;
+
+  @IsBoolean()
+  @IsOptional()
+  active?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  serverExists?: boolean;
+
+  @IsEnum(['JAVA', 'BEDROCK'])
+  @IsOptional()
+  edition?: ServerEdition;
+
+  @IsEnum(['VANILLA', 'FORGE', 'NEOFORGE', 'AUTO_CURSEFORGE', 'CURSEFORGE', 'FTBA', 'MODRINTH', 'GTNH', 'SPIGOT', 'FABRIC', 'MAGMA', 'PAPER', 'QUILT', 'BUKKIT', 'PUFFERFISH', 'PURPUR', 'LEAF', 'FOLIA', 'CUSTOM'])
+  @IsOptional()
+  serverType?: 'VANILLA' | 'FORGE' | 'NEOFORGE' | 'AUTO_CURSEFORGE' | 'CURSEFORGE' | 'FTBA' | 'MODRINTH' | 'GTNH' | 'SPIGOT' | 'FABRIC' | 'MAGMA' | 'PAPER' | 'QUILT' | 'BUKKIT' | 'PUFFERFISH' | 'PURPUR' | 'LEAF' | 'FOLIA' | 'CUSTOM';
+
+  // General configuration
+  @IsString()
+  @IsOptional()
+  serverName?: string;
+
+  @IsString()
+  @IsOptional()
+  motd?: string;
+
+  @IsString()
+  @IsOptional()
+  port?: string;
+
+  @IsEnum(['peaceful', 'easy', 'normal', 'hard'])
+  @IsOptional()
+  difficulty?: 'peaceful' | 'easy' | 'normal' | 'hard';
+
+  @IsString()
+  @IsOptional()
+  maxPlayers?: string;
+
+  @IsString()
+  @IsOptional()
+  ops?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  whiteList?: boolean;
+
+  @IsString()
+  @IsOptional()
+  whitelistPlayers?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  onlineMode?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  pvp?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  commandBlock?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  allowFlight?: boolean;
+
+  @IsEnum(['survival', 'creative', 'adventure', 'spectator'])
+  @IsOptional()
+  gameMode?: 'survival' | 'creative' | 'adventure' | 'spectator';
+
+  @IsString()
+  @IsOptional()
+  seed?: string;
+
+  @IsString()
+  @IsOptional()
+  worldSource?: string;
+
+  @IsEnum(['local', 'global'])
+  @IsOptional()
+  worldScope?: 'local' | 'global';
+
+  @IsString()
+  @IsOptional()
+  worldLevelName?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  forceWorldCopy?: boolean;
+
+  @IsString()
+  @IsOptional()
+  levelType?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  hardcore?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  spawnAnimals?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  spawnMonsters?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  spawnNpcs?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  generateStructures?: boolean;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(EXPERIMENTAL_PACKS.length)
+  @IsIn(EXPERIMENTAL_PACKS, { each: true })
+  experimentalPacks?: string[];
+
+  @IsBoolean()
+  @IsOptional()
+  allowNether?: boolean;
+
+  @IsString()
+  @IsOptional()
+  entityBroadcastRange?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  enableAutoStop?: boolean;
+
+  @IsString()
+  @IsOptional()
+  autoStopTimeoutEst?: string;
+
+  @IsString()
+  @IsOptional()
+  autoStopTimeoutInit?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  enableAutoPause?: boolean;
+
+  @IsString()
+  @IsOptional()
+  autoPauseTimeoutEst?: string;
+
+  @IsString()
+  @IsOptional()
+  autoPauseTimeoutInit?: string;
+
+  @IsString()
+  @IsOptional()
+  autoPauseKnockInterface?: string;
+
+  @IsString()
+  @IsOptional()
+  playerIdleTimeout?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  preventProxyConnections?: boolean;
+
+  @IsString()
+  @IsOptional()
+  opPermissionLevel?: string;
+
+  @IsString()
+  @IsOptional()
+  spawnProtection?: string;
+
+  // RCON
+  @IsBoolean()
+  @IsOptional()
+  enableRcon?: boolean;
+
+  @IsString()
+  @IsOptional()
+  rconPort?: string;
+
+  @IsString()
+  @IsOptional()
+  rconPassword?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  broadcastRconToOps?: boolean;
+
+  // Resources
+  @IsString()
+  @IsOptional()
+  initMemory?: string;
+
+  @IsString()
+  @IsOptional()
+  maxMemory?: string;
+
+  @IsString()
+  @IsOptional()
+  cpuLimit?: string;
+
+  @IsString()
+  @IsOptional()
+  cpuReservation?: string;
+
+  @IsString()
+  @IsOptional()
+  memoryReservation?: string;
+
+  @IsString()
+  @IsOptional()
+  viewDistance?: string;
+
+  @IsString()
+  @IsOptional()
+  simulationDistance?: string;
+
+  @IsString()
+  @Matches(/^\d+$/, { message: 'uid must be a numeric string' })
+  @IsOptional()
+  uid?: string;
+
+  @IsString()
+  @Matches(/^\d+$/, { message: 'gid must be a numeric string' })
+  @IsOptional()
+  gid?: string;
+
+  // Backup configuration
+  @IsBoolean()
+  @IsOptional()
+  enableBackup?: boolean;
+
+  @IsString()
+  @IsOptional()
+  backupInterval?: string;
+
+  @IsString()
+  @IsOptional()
+  backupMethod?: string;
+
+  @IsString()
+  @IsOptional()
+  backupInitialDelay?: string;
+
+  @IsString()
+  @IsOptional()
+  backupPruneDays?: string;
+
+  @IsString()
+  @IsOptional()
+  backupDestDir?: string;
+
+  @IsString()
+  @IsOptional()
+  backupHostDir?: string;
+
+  @IsString()
+  @IsOptional()
+  backupName?: string;
+
+  @IsString()
+  @IsOptional()
+  resticRepository?: string;
+
+  @IsString()
+  @IsOptional()
+  resticPassword?: string;
+
+  @IsString()
+  @IsOptional()
+  resticS3AccessKeyId?: string;
+
+  @IsString()
+  @IsOptional()
+  resticS3SecretAccessKey?: string;
+
+  @IsString()
+  @IsOptional()
+  resticRetention?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  useAikarFlags?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  enableJmx?: boolean;
+
+  @IsString()
+  @IsOptional()
+  jmxHost?: string;
+
+  @IsString()
+  @IsOptional()
+  jvmOpts?: string;
+
+  @IsString()
+  @IsOptional()
+  jvmXxOpts?: string;
+
+  @IsString()
+  @IsOptional()
+  jvmDdOpts?: string;
+
+  @IsString()
+  @IsOptional()
+  extraArgs?: string;
+
+  @IsString()
+  @IsOptional()
+  tz?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  enableRollingLogs?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  logTimestamp?: boolean;
+
+  // Docker
+  @IsString()
+  @IsOptional()
+  dockerImage?: string;
+
+  @IsString()
+  @IsOptional()
+  minecraftVersion?: string;
+
+  @IsString()
+  @IsOptional()
+  dockerVolumes?: string;
+
+  @IsEnum(['no', 'always', 'on-failure', 'unless-stopped'])
+  @IsOptional()
+  restartPolicy?: 'no' | 'always' | 'on-failure' | 'unless-stopped';
+
+  // Only used with `on-failure`: Docker gives up after this many restarts
+  @IsInt()
+  @Min(1)
+  @Max(10)
+  @IsOptional()
+  restartMaxRetries?: number;
+
+  @IsString()
+  @IsOptional()
+  stopDelay?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  execDirectly?: boolean;
+
+  @IsString()
+  @IsOptional()
+  envVars?: string;
+
+  // Vanilla Tweaks share codes (datapacks or crafting tweaks), passed as VANILLATWEAKS_SHARECODE
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(10)
+  @Matches(/^[A-Za-z0-9]{3,16}$/, { each: true, message: 'Each Vanilla Tweaks share code must be 3-16 letters or digits' })
+  vanillaTweaksCodes?: string[];
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(16384)
+  rconCmdsStartup?: string;
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(16384)
+  rconCmdsFirstConnect?: string;
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(16384)
+  rconCmdsOnConnect?: string;
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(16384)
+  rconCmdsOnDisconnect?: string;
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(16384)
+  rconCmdsLastDisconnect?: string;
+
+  @IsString()
+  @IsOptional()
+  dockerLabels?: string;
+
+  // Raw compose YAML merged into the generated file (advanced, admin-only)
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => ComposeSnippetDto)
+  @IsOptional()
+  composeSnippets?: ComposeSnippetDto[];
+
+  // Backup includes/excludes
+  @IsString()
+  @IsOptional()
+  backupIncludes?: string;
+
+  @IsString()
+  @IsOptional()
+  backupExcludes?: string;
+
+  @IsEnum(['gzip', 'bzip2', 'zstd'])
+  @IsOptional()
+  tarCompressMethod?: 'gzip' | 'bzip2' | 'zstd';
+
+  @IsBoolean()
+  @IsOptional()
+  backupOnStartup?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  pauseIfNoPlayers?: boolean;
+
+  @IsString()
+  @IsOptional()
+  playersOnlineCheckInterval?: string;
+
+  @IsString()
+  @IsOptional()
+  rconRetries?: string;
+
+  @IsString()
+  @IsOptional()
+  rconRetryInterval?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  enableSaveAll?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  enableSync?: boolean;
+
+  // Forge specific
+  @IsString()
+  @IsOptional()
+  forgeBuild?: string;
+
+  // Neoforge specific
+  @IsString()
+  @IsOptional()
+  neoforgeBuild?: string;
+
+  // Fabric specific
+  @IsString()
+  @IsOptional()
+  fabricLoaderVersion?: string;
+
+  @IsString()
+  @IsOptional()
+  fabricLauncherVersion?: string;
+
+  @IsString()
+  @IsOptional()
+  fabricLauncher?: string;
+
+  @IsString()
+  @IsOptional()
+  fabricLauncherUrl?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  fabricForceReinstall?: boolean;
+
+  // Modrinth specific
+  @IsString()
+  @IsOptional()
+  modrinthProjects?: string;
+
+  @IsEnum(['none', 'required', 'optional'])
+  @IsOptional()
+  modrinthDownloadDependencies?: 'none' | 'required' | 'optional';
+
+  @IsEnum(['release', 'beta', 'alpha'])
+  @IsOptional()
+  modrinthDefaultVersionType?: 'release' | 'beta' | 'alpha';
+
+  @IsString()
+  @IsOptional()
+  modrinthLoader?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  versionFromModrinthProjects?: boolean;
+
+  @IsString()
+  @IsOptional()
+  modrinthModpack?: string;
+
+  // GTNH specific
+  @IsString()
+  @IsOptional()
+  gtnhPackVersion?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  gtnhDeleteBackups?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  skipGtnhUpdateCheck?: boolean;
+
+  // FTBA specific
+  @IsString()
+  @IsOptional()
+  ftbModpackId?: string;
+
+  @IsString()
+  @IsOptional()
+  ftbModpackVersionId?: string;
+
+  // Ports
+  @IsString({ each: true })
+  @ValidateBy(
+    {
+      name: 'isPortMapping',
+      validator: {
+        validate: (value: unknown) => typeof value === 'string' && isValidPortMapping(value),
+        defaultMessage: buildMessage(
+          (each) => `${each}$property must use Docker Compose port syntax, e.g. "3091:3091" or "3091:3091/udp"`,
+        ),
+      },
+    },
+    { each: true },
+  )
+  @IsOptional()
+  extraPorts: string[];
+
+  // CurseForge specific
+  @IsEnum(['url', 'slug', 'file'])
+  @IsOptional()
+  cfMethod?: 'url' | 'slug' | 'file';
+
+  @IsString()
+  @IsOptional()
+  cfUrl?: string;
+
+  @IsString()
+  @IsOptional()
+  cfSlug?: string;
+
+  @IsString()
+  @IsOptional()
+  cfFile?: string;
+
+  @IsString()
+  @IsOptional()
+  cfApiKey?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  cfSync?: boolean;
+
+  @IsString()
+  @IsOptional()
+  cfFiles?: string;
+
+  @IsString()
+  @IsOptional()
+  cfForceInclude?: string;
+
+  @IsString()
+  @IsOptional()
+  cfExclude?: string;
+
+  @IsString()
+  @IsOptional()
+  cfFilenameMatcher?: string;
+
+  // Container path to an unpublished modpack zip, e.g. /modpacks/pack.zip
+  @IsString()
+  @IsOptional()
+  cfModpackZip?: string;
+
+  @IsString()
+  @IsOptional()
+  cfParallelDownloads?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  cfOverridesSkipExisting?: boolean;
+
+  @IsString()
+  @IsOptional()
+  cfSetLevelFrom?: string;
+
+  // Container path to an archive unpacked over /data, e.g. /modpacks/pack.zip.
+  // Used for modpack zips that declare no loader of their own.
+  @IsString()
+  @IsOptional()
+  genericPack?: string;
+
+  // Manual CurseForge (deprecated) specific
+  @IsString()
+  @IsOptional()
+  cfServerMod?: string;
+
+  @IsString()
+  @IsOptional()
+  cfBaseDir?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  useModpackStartScript?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  ftbLegacyJavaFixer?: boolean;
+
+  // Plugin specific (for SPIGOT, PAPER, BUKKIT, PUFFERFISH, PURPUR, LEAF, FOLIA)
+  @IsString()
+  @IsOptional()
+  spigetResources?: string;
+
+  // Paper specific
+  @IsString()
+  @IsOptional()
+  paperBuild?: string;
+
+  @IsString()
+  @IsOptional()
+  paperChannel?: string;
+
+  @IsString()
+  @IsOptional()
+  paperDownloadUrl?: string;
+
+  // Bukkit/Spigot specific
+  @IsString()
+  @IsOptional()
+  bukkitDownloadUrl?: string;
+
+  @IsString()
+  @IsOptional()
+  spigotDownloadUrl?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  buildFromSource?: boolean;
+
+  // Pufferfish specific
+  @IsString()
+  @IsOptional()
+  pufferfishBuild?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  useFlareFlags?: boolean;
+
+  // Purpur specific
+  @IsString()
+  @IsOptional()
+  purpurBuild?: string;
+
+  @IsString()
+  @IsOptional()
+  purpurDownloadUrl?: string;
+
+  // Leaf specific
+  @IsString()
+  @IsOptional()
+  leafBuild?: string;
+
+  // Folia specific
+  @IsString()
+  @IsOptional()
+  foliaBuild?: string;
+
+  @IsString()
+  @IsOptional()
+  foliaChannel?: string;
+
+  @IsString()
+  @IsOptional()
+  foliaDownloadUrl?: string;
+
+  // CUSTOM: a .jar under the server folder (or an absolute container path), or a URL.
+  @IsString()
+  @IsOptional()
+  @Matches(/^(|https?:\/\/\S+|(?!.*\.\.)[\w\-. /]+\.jar)$/i, { message: 'customServer must be a .jar path inside the server folder or an http(s) URL' })
+  customServer?: string;
+
+  // General Paper/Bukkit/Spigot config
+  @IsBoolean()
+  @IsOptional()
+  skipDownloadDefaults?: boolean;
+
+  // Proxy configuration
+  @IsString()
+  @IsOptional()
+  proxyHostname?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  useProxy?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  useAutoScale?: boolean;
+
+  // Velocity network membership; only honoured while the edge is Velocity.
+  @IsBoolean()
+  @IsOptional()
+  velocityEnabled?: boolean;
+
+  // Position in Velocity's `try` list; null keeps the server out of the fallback chain.
+  @IsInt()
+  @Min(0)
+  @Max(999)
+  @IsOptional()
+  velocityFallbackOrder?: number | null;
+
+  // Bedrock-specific configuration
+  @IsBoolean()
+  @IsOptional()
+  allowCheats?: boolean;
+
+  @IsString()
+  @IsOptional()
+  tickDistance?: string;
+
+  @IsString()
+  @IsOptional()
+  maxThreads?: string;
+
+  @IsEnum(['visitor', 'member', 'operator'])
+  @IsOptional()
+  defaultPlayerPermissionLevel?: 'visitor' | 'member' | 'operator';
+
+  @IsBoolean()
+  @IsOptional()
+  texturepackRequired?: boolean;
+
+  @IsString()
+  @IsOptional()
+  serverPortV6?: string;
+
+  // Mod Watch annotations; not compose input, kept here so cloneServer carries them.
+  @IsObject()
+  @IsOptional()
+  modNotes?: Record<string, string>;
+
+  @IsString()
+  @IsOptional()
+  modWatchTargetVersion?: string;
+
+  // Custom Metrics tick command and optional regexes (one capture group each) that read TPS and
+  // average MSPT from its reply. Not compose input, saved through PUT /servers/:id/tick-command
+  // (admin only), not the whole-form save. Unset means the built-in NeoForge/spark probes.
+  @IsString()
+  @IsOptional()
+  tickCommand?: string;
+
+  @IsString()
+  @IsOptional()
+  tickTpsPattern?: string;
+
+  @IsString()
+  @IsOptional()
+  tickMsptPattern?: string;
+
+  // Default "TP Spawn" coordinates for the Players tab quick action; not compose input, saved
+  // through PUT /servers/:id/spawn-point, not the whole-form save. Falls back to (0, 100, 0)
+  // when unset.
+  @IsNumber()
+  @IsOptional()
+  spawnX?: number;
+
+  @IsNumber()
+  @IsOptional()
+  spawnY?: number;
+
+  @IsNumber()
+  @IsOptional()
+  spawnZ?: number;
+
+  // Activity log opt-in (chat is personal data); saved through /activity, never compose input.
+  @IsBoolean()
+  @IsOptional()
+  activityTracking?: boolean;
+}
+
+export class UpdateServerConfigDto extends PartialType(ServerConfigDto) {}
+
+export type ServerConfig = ServerConfigDto;
+export type UpdateServerConfig = UpdateServerConfigDto;
