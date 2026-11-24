@@ -5,12 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/nickheyer/discopanel/internal/config"
 	models "github.com/nickheyer/discopanel/internal/db"
 )
 
@@ -20,7 +20,7 @@ const haosLabel = "io.mcpanelhaos.installation"
 
 func HAOSMode() bool { return os.Getenv("MCPANEL_HAOS") == "true" }
 
-func HAOSMemory(memory int) int { return max(5120, min(7168, memory)) }
+func HAOSParallel() bool { return HAOSMode() && os.Getenv("MCPANEL_HAOS_PARALLEL") == "true" }
 
 func haosEnvironment(env []string, memory int) []string {
 	filtered := make([]string, 0, len(env)+4)
@@ -32,8 +32,8 @@ func haosEnvironment(env []string, memory int) []string {
 		}
 		filtered = append(filtered, value)
 	}
-	heap := strconv.Itoa(HAOSMemory(memory)-1024) + "M"
-	return append(filtered, "INIT_MEMORY="+heap, "MAX_MEMORY="+heap, "SERVER_PORT=25565", "STOP_DURATION=105")
+	initial, maximum := config.HAOSHeap(memory)
+	return append(filtered, "INIT_MEMORY="+initial, "MAX_MEMORY="+maximum, "SERVER_PORT=25565", "STOP_DURATION=105")
 }
 
 type HAOSBusyError struct {
@@ -50,7 +50,7 @@ var ErrHAOSSwitchChanged = errors.New("Der aktive Server hat sich geändert. Bit
 // SwitchHAOSContainer permits a switch only from the server named in the
 // user's confirmation. Automated callers always take the strict start path.
 func (c *Client) SwitchHAOSContainer(ctx context.Context, targetID, fromServerID string) error {
-	if !HAOSMode() || fromServerID == "" {
+	if !HAOSMode() || HAOSParallel() || fromServerID == "" {
 		return ErrHAOSSwitchChanged
 	}
 	return c.startContainer(ctx, targetID, fromServerID)
@@ -73,12 +73,18 @@ func (c *Client) prepareHAOSStart(ctx context.Context, targetID, fromServerID st
 	if err != nil {
 		return err
 	}
+	parallel := HAOSParallel()
+	active := 0
 	for _, other := range related {
 		switch other.State {
 		case "created", "exited", "dead":
 			continue
 		}
 		if other.ID == target.ID {
+			continue
+		}
+		if parallel {
+			active++
 			continue
 		}
 		if fromServerID == "" {
@@ -96,6 +102,9 @@ func (c *Client) prepareHAOSStart(ctx context.Context, targetID, fromServerID st
 		fromServerID = ""
 	}
 
+	if parallel && active >= 2 {
+		return errors.New("Es laufen bereits zwei Minecraft-Server. Stoppe einen Server, bevor du einen weiteren startest.")
+	}
 	if fromServerID != "" {
 		return ErrHAOSSwitchChanged
 	}

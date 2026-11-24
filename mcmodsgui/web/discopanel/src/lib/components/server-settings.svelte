@@ -156,8 +156,8 @@
 
 		// Prevent negative values
 		if (value < 0) {
-			input.value = '512';
-			formData.memory = 512;
+			input.value = '5120';
+			formData.memory = 5120;
 		}
 	}
 
@@ -240,17 +240,18 @@
 		</div>
 
 		<div class="space-y-2">
-			<Label for="memory" class="text-sm font-medium">Memory (MB)</Label>
+			<Label for="memory" class="text-sm font-medium">Docker-Speicherlimit (MiB)</Label>
 			<Input
 				id="memory"
 				type="number"
 				bind:value={formData.memory}
 				oninput={handleMemoryInput}
-				min="512"
+				min="5120"
+				max="10240"
 				class="h-10"
 			/>
 			<p class="text-xs text-muted-foreground">
-				Recommended: {formData.modLoader === 'vanilla' ? '2048' : '4096'} MB
+				5120 MiB für 4 GiB Java-Heap. 10240 MiB für 6 GiB Start- und 8 GiB maximalen Java-Heap.
 			</p>
 		</div>
 

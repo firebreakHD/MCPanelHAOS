@@ -1,6 +1,6 @@
 # MCPanelHAOS
 
-DiscoPanel als Home-Assistant-OS-Add-on für Minecraft Java auf demselben Gerät. Erstelle zwei getrennte Serverprofile mit eigenen Namen, Welten und Modpacks. Es kann jeweils ein Profil laufen. Beide sind unter derselben HAOS-IP über TCP-Port **25565** erreichbar.
+DiscoPanel als Home-Assistant-OS-Add-on für Minecraft Java auf demselben Gerät. Erstelle zwei getrennte Serverprofile mit eigenen Namen, Welten und Modpacks. Standardmäßig läuft jeweils ein Profil über TCP-Port **25565**. Optional können zwei Server gleichzeitig unter derselben HAOS-IP mit verschiedenen Ports laufen.
 
 ## Installation
 
@@ -17,6 +17,16 @@ Den **CurseForge API Key** in DiscoPanel unter **Global Settings** speichern. Gi
 
 Erstelle einen Vanilla-Server unter **Servers → New Server** oder wähle ein Modpack unter **Modpacks**. Neue Server starten standardmäßig erst auf deinen Klick. Wenn ein Server bereits läuft, klickst du beim anderen auf **Start** und bestätigst den Wechsel. Das Panel wartet auf die Beendigung des bisherigen Containers. Wenn beide aus sein sollen, klicke beim laufenden Server auf **Stop**. Lass **Auto Start** für beide aus, wenn nach einem Add-on-Neustart beide aus bleiben sollen.
 
-Der Standard ist **4 GiB Java-Heap** und **5 GiB hartes Docker-Limit** ohne zusätzlichen Swap. Stelle für 5 oder 6 GiB Heap das Docker-Limit am jeweiligen Server auf 6144 oder 7168 MiB. Die zusätzlichen 1024 MiB sind für JVM- und Container-Overhead reserviert.
+## Zwei Server gleichzeitig
+
+1. In der Home-Assistant-Konfiguration von **MCPanelHAOS** `parallel_servers` einschalten, speichern und das Add-on neu starten.
+2. Einem Server unter **Config** den Port **25565**, dem anderen **25566** geben. Falls beide bereits auf 25565 stehen, stoppe den zweiten Server vor dem Ändern. Speichere und starte anschließend beide.
+3. Im Minecraft-Client die HAOS-IP mit dem jeweiligen Port verwenden.
+
+Mit `parallel_servers: false` gilt wieder die Ein-Server-Sperre mit bestätigtem Wechsel. Bereits eingestellte Ports bleiben gespeichert. Wenn beide Profile wieder denselben Port nutzen sollen, stelle sie in diesem Modus auf 25565.
+
+## Speicher
+
+Standard sind **4 GiB Java-Heap** bei **5 GiB Docker-Limit**. Für 5 oder 6 GiB Heap setze das Docker-Limit auf 6144 oder 7168 MiB. Stoppe den Server vor einer Speicheränderung. Für 6 GiB Start-Heap und 8 GiB maximalen Heap setze das Docker-Limit auf **10240 MiB**. Entferne dazu manuell gesetzte `-Xms`- und `-Xmx`-Argumente aus **JVM Options**, damit nur die vom Panel erzeugten Heap-Werte gelten. Bei zwei Servern addieren sich die Docker-Limits. Home Assistant und andere Add-ons brauchen weiterhin ihren eigenen Speicher.
 
 [Details zu Daten, Backups und Update](mcmodsgui/DOCS.md) · [Änderungen](mcmodsgui/CHANGELOG.md) · [DiscoPanel-Quellprojekt](https://github.com/discohaus/discopanel)

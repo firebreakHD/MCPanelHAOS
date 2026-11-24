@@ -1,6 +1,6 @@
 name: MCPanelHAOS
 description: DiscoPanel für Minecraft-Java-Modserver auf diesem Home Assistant OS
-version: "2.0.1"
+version: "2.1.0"
 slug: mcmodsgui
 arch:
   - amd64
@@ -27,6 +27,8 @@ backup: cold
 options:
   panel_hostname: homeassistant.local
   panel_port: 18443
+  parallel_servers: false
 schema:
   panel_hostname: str
   panel_port: "int(1,65535)"
+  parallel_servers: bool

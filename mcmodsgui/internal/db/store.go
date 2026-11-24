@@ -161,27 +161,26 @@ func (s *Store) SaveServerConfig(ctx context.Context, config *ServerConfig) erro
 
 // UpdateServerConfigMemory updates memory settings in ServerConfig
 func (s *Store) UpdateServerConfigMemory(ctx context.Context, serverID string, memory int) error {
-	config, err := s.GetServerConfig(ctx, serverID)
+	serverConfig, err := s.GetServerConfig(ctx, serverID)
 	if err != nil {
 		return err
 	}
 
 	if os.Getenv("MCPANEL_HAOS") == "true" {
-		heap := fmt.Sprintf("%dM", memory-1024)
-		config.Memory = nil
-		config.InitMemory = &heap
-		config.MaxMemory = &heap
-		return s.SaveServerConfig(ctx, config)
+		initial, maximum := config.HAOSHeap(memory)
+		serverConfig.Memory = nil
+		serverConfig.InitMemory = &initial
+		serverConfig.MaxMemory = &maximum
+		return s.SaveServerConfig(ctx, serverConfig)
 	}
 	// Update memory and max memory (they're the same I THINK) ... Note: They are not...
 	strServerMem := fmt.Sprintf("%dM", int64(float64(memory)*.75))
-	config.MaxMemory = &strServerMem
-
-	if config.Memory != nil {
-		config.Memory = &strServerMem
+	serverConfig.MaxMemory = &strServerMem
+	if serverConfig.Memory != nil {
+		serverConfig.Memory = &strServerMem
 	}
 
-	return s.SaveServerConfig(ctx, config)
+	return s.SaveServerConfig(ctx, serverConfig)
 }
 
 // ClearEphemeralConfigFields clears all ephemeral configuration fields

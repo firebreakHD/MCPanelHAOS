@@ -22,6 +22,8 @@ fi
 export DISCOPANEL_SELF_CONTAINER_ID="$self"
 MCPANEL_HAOS_INSTALLATION="$(printf '%s' "$host_app" | sha256sum | cut -d ' ' -f 1)"
 export MCPANEL_HAOS_INSTALLATION
+MCPANEL_HAOS_PARALLEL="$(jq -r '.parallel_servers // false' /app/options.json)"
+export MCPANEL_HAOS_PARALLEL
 export DISCOPANEL_DATA_DIR=/app/discopanel/data
 export DISCOPANEL_HOST_DATA_PATH="$host_app/discopanel/data"
 export XDG_DATA_HOME=/app/discopanel/caddy

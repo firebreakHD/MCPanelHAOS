@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -49,6 +50,7 @@ type ServerService struct {
 	metricsCollector *metrics.Collector
 	moduleManager    *module.Manager
 	bus              *events.Bus
+	portMu           sync.Mutex // Serializes HAOS profile writes that may assign a host port.
 }
 
 // NewServerService creates a new server service
@@ -358,6 +360,10 @@ func (s *ServerService) GetServer(ctx context.Context, req *connect.Request[v1.G
 
 // CreateServer creates a new server
 func (s *ServerService) CreateServer(ctx context.Context, req *connect.Request[v1.CreateServerRequest]) (*connect.Response[v1.CreateServerResponse], error) {
+	if docker.HAOSParallel() {
+		s.portMu.Lock()
+		defer s.portMu.Unlock()
+	}
 	msg := req.Msg
 
 	// Convert mod loader from proto
@@ -409,8 +415,10 @@ func (s *ServerService) CreateServer(ctx context.Context, req *connect.Request[v
 		if proxyHostname != "" || proxyListenerID != "" || msg.Detached || msg.DockerOverrides != nil {
 			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("MCPanelHAOS verwendet direkten Minecraft-Zugriff und feste Docker-Sicherheitseinstellungen."))
 		}
-		port = docker.DefaultMinecraftPort
-		msg.Memory = int32(docker.HAOSMemory(int(msg.Memory)))
+		if !docker.HAOSParallel() {
+			port = docker.DefaultMinecraftPort
+		}
+		msg.Memory = int32(config.HAOSMemory(int(msg.Memory)))
 	}
 
 	if proxyHostname != "" {
@@ -461,9 +469,9 @@ func (s *ServerService) CreateServer(ctx context.Context, req *connect.Request[v
 			proxyListenerID = defaultListener.ID
 			port = defaultListener.Port
 		}
-	} else if !docker.HAOSMode() {
+	} else if !docker.HAOSMode() || docker.HAOSParallel() {
 		// For non-proxy servers, must have a unique port
-		if port == 0 {
+		if port < 1 || port > 65535 {
 			return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("port is required for non-proxy servers"))
 		}
 
@@ -603,10 +611,10 @@ func (s *ServerService) CreateServer(ctx context.Context, req *connect.Request[v
 
 	// Set memory configuration
 	if docker.HAOSMode() {
-		heap := fmt.Sprintf("%dM", server.Memory-1024)
+		initial, maximum := config.HAOSHeap(server.Memory)
 		serverConfig.Memory = nil
-		serverConfig.InitMemory = &heap
-		serverConfig.MaxMemory = &heap
+		serverConfig.InitMemory = &initial
+		serverConfig.MaxMemory = &maximum
 	}
 	if serverConfig.MaxMemory == nil && serverConfig.Memory == nil && serverConfig.InitMemory == nil {
 		strMax := fmt.Sprintf("%dM", int(float64(server.Memory)*0.75))
@@ -754,6 +762,10 @@ func (s *ServerService) CreateServer(ctx context.Context, req *connect.Request[v
 
 // UpdateServer updates a server
 func (s *ServerService) UpdateServer(ctx context.Context, req *connect.Request[v1.UpdateServerRequest]) (*connect.Response[v1.UpdateServerResponse], error) {
+	if docker.HAOSParallel() {
+		s.portMu.Lock()
+		defer s.portMu.Unlock()
+	}
 	msg := req.Msg
 
 	server, err := s.store.GetServer(ctx, msg.Id)
@@ -779,11 +791,11 @@ func (s *ServerService) UpdateServer(ctx context.Context, req *connect.Request[v
 		if (msg.Detached != nil && *msg.Detached) || msg.DockerOverrides != nil {
 			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("MCPanelHAOS verwendet feste Docker-Sicherheitseinstellungen."))
 		}
-		if msg.Port != nil && *msg.Port != docker.DefaultMinecraftPort {
-			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("MCPanelHAOS verwendet den gemeinsamen Minecraft-Port 25565."))
+		if !docker.HAOSParallel() && msg.Port != nil && int(*msg.Port) != server.Port && *msg.Port != docker.DefaultMinecraftPort {
+			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("Aktiviere parallel_servers in der Add-on-Konfiguration, um einen eigenen Minecraft-Port zu setzen."))
 		}
 		if msg.Memory > 0 {
-			msg.Memory = int32(docker.HAOSMemory(int(msg.Memory)))
+			msg.Memory = int32(config.HAOSMemory(int(msg.Memory)))
 		}
 	}
 	if msg.Port != nil && int(*msg.Port) != server.Port {
@@ -802,7 +814,7 @@ func (s *ServerService) UpdateServer(ctx context.Context, req *connect.Request[v
 			s.log.Error("Failed to check port: %v", err)
 			return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("failed to check port availability"))
 		}
-		if existing != nil && existing.ID != server.ID {
+		if existing != nil && existing.ID != server.ID && (!docker.HAOSMode() || docker.HAOSParallel()) {
 			return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("port already in use"))
 		}
 
@@ -810,6 +822,13 @@ func (s *ServerService) UpdateServer(ctx context.Context, req *connect.Request[v
 			return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("port is already in use by the proxy server"))
 		}
 
+		if docker.HAOSMode() {
+			for _, additional := range server.AdditionalPorts {
+				if int(additional.GetHostPort()) == newPort && additional.GetProtocol() != "udp" {
+					return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("port %d is already configured as an additional TCP port", newPort))
+				}
+			}
+		}
 		server.Port = newPort
 		needsRecreation = true
 	}
@@ -1583,7 +1602,7 @@ func (s *ServerService) ClearServerLogs(ctx context.Context, req *connect.Reques
 
 // GetNextAvailablePort gets the next available port
 func (s *ServerService) GetNextAvailablePort(ctx context.Context, req *connect.Request[v1.GetNextAvailablePortRequest]) (*connect.Response[v1.GetNextAvailablePortResponse], error) {
-	if docker.HAOSMode() {
+	if docker.HAOSMode() && !docker.HAOSParallel() {
 		return connect.NewResponse(&v1.GetNextAvailablePortResponse{Port: docker.DefaultMinecraftPort}), nil
 	}
 	// Get all servers

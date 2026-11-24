@@ -12,6 +12,20 @@ import (
 	"github.com/spf13/viper"
 )
 
+// HAOSMemory is the hard Docker limit in MiB, including Java's native memory.
+func HAOSMemory(memory int) int { return max(5120, min(10240, memory)) }
+
+// HAOSHeap preserves the original heap sizes and leaves 2 GiB of headroom
+// for the largest heaps. Keep the initial heap at or below 6 GiB.
+func HAOSHeap(memory int) (initial, maximum string) {
+	limit := HAOSMemory(memory)
+	heap := limit - 1024
+	if limit > 7168 {
+		heap = max(6144, limit-2048)
+	}
+	return fmt.Sprintf("%dM", min(6144, heap)), fmt.Sprintf("%dM", heap)
+}
+
 type Config struct {
 	Server    ServerConfig    `mapstructure:"server" json:"server"`
 	Database  DatabaseConfig  `mapstructure:"database" json:"database"`

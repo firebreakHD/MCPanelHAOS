@@ -1,5 +1,11 @@
 # Änderungen
 
+## 2.1.0
+
+- Optionaler Parallelbetrieb für bis zu zwei Minecraft-Server mit getrennten Host-Ports, etwa 25565 und 25566. Der Ein-Server-Modus bleibt Standard.
+- Docker-Speicherlimit bis 10 GiB. Bei 10 GiB startet Java mit 6 GiB Heap und kann bis 8 GiB Heap nutzen.
+- Bestehende Serverprofile, Welten und CurseForge-Einstellungen bleiben beim Update erhalten.
+
 ## 2.0.1
 
 - Stopp und Serverwechsel warten bei der Ersteinrichtung auf den Start der Minecraft-Laufzeit. Dadurch erreicht das Stoppsignal den Java-Shutdown-Handler.

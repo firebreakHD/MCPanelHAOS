@@ -826,14 +826,14 @@
 									id="memory"
 									type="number"
 									min="5120"
-									max="7168"
+									max="10240"
 									bind:value={formData.memory}
 									disabled={loading}
 									class="h-10"
 								/>
 							</div>
 							<p class="text-xs text-muted-foreground">
-								5120–7168 MiB. Minecraft erhält davon 4096–6144 MiB Java-Heap.
+								5120–10240 MiB. Minecraft erhält davon bis zu 8192 MiB Java-Heap.
 							</p>
 						</div>
 

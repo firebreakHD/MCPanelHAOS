@@ -23,6 +23,7 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
+	configpkg "github.com/nickheyer/discopanel/internal/config"
 	models "github.com/nickheyer/discopanel/internal/db"
 	"github.com/nickheyer/discopanel/internal/minecraft"
 	"github.com/nickheyer/discopanel/pkg/logger"
@@ -399,10 +400,12 @@ func (c *Client) CreateContainer(ctx context.Context, server *models.Server, ser
 		env = haosEnvironment(env, server.Memory)
 	}
 
-	// Determine container port - proxy servers always use default port internally
+	// HAOS and proxied servers use the default Minecraft port inside the container.
 	useProxy := server.ProxyHostname != ""
 	containerPort := server.Port
-	if useProxy {
+	if HAOSMode() {
+		containerPort = DefaultMinecraftPort
+	} else if useProxy {
 		containerPort = DefaultMinecraftPort
 		// Override SERVER_PORT env var for proxy servers
 		filtered := make([]string, 0, len(env))
@@ -448,8 +451,11 @@ func (c *Client) CreateContainer(ctx context.Context, server *models.Server, ser
 			protocol = "tcp"
 		}
 		portKey := nat.Port(fmt.Sprintf("%d/%s", port.GetContainerPort(), protocol))
-		portBindings[portKey] = []nat.PortBinding{
-			{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", port.GetHostPort())},
+		binding := nat.PortBinding{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", port.GetHostPort())}
+		if HAOSMode() && portKey == nat.Port("25565/tcp") {
+			portBindings[portKey] = append(portBindings[portKey], binding)
+		} else {
+			portBindings[portKey] = []nat.PortBinding{binding}
 		}
 		c.log.Debug("Additional port mapping: %s (%d:%d/%s)", port.GetName(), port.GetHostPort(), port.GetContainerPort(), protocol)
 	}
@@ -507,7 +513,7 @@ func (c *Client) CreateContainer(ctx context.Context, server *models.Server, ser
 	if HAOSMode() {
 		config.Labels[haosLabel] = os.Getenv("MCPANEL_HAOS_INSTALLATION")
 		hostConfig.RestartPolicy = container.RestartPolicy{Name: "no"}
-		limit := int64(HAOSMemory(server.Memory)) * 1024 * 1024
+		limit := int64(configpkg.HAOSMemory(server.Memory)) * 1024 * 1024
 		hostConfig.Memory = limit
 		hostConfig.MemorySwap = limit
 		// RCON stays on the private bridge or is called through docker exec.
@@ -652,8 +658,11 @@ func (c *Client) RecreateContainer(ctx context.Context, oldContainerID string, s
 		if err != nil {
 			// Container may not exist, that's ok - continue with creation
 			c.log.Debug("Container %s not found during recreation: %v", oldContainerID, err)
-		} else if status == models.StatusRunning || status == models.StatusUnhealthy {
-			result.WasRunning = true
+		} else {
+			result.WasRunning = status == models.StatusRunning || status == models.StatusUnhealthy ||
+				(HAOSMode() && status == models.StatusStarting)
+		}
+		if result.WasRunning || HAOSMode() {
 			if _, err := c.StopContainer(ctx, oldContainerID); err != nil {
 				return nil, fmt.Errorf("failed to stop container: %w", err)
 			}
